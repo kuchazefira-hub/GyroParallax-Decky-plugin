@@ -1,0 +1,45 @@
+{
+  "name": "gyro-parallax",
+  "version": "1.1.7",
+  "description": "Adds a smooth gyro-controlled 3D parallax effect to Steam Deck game pages.",
+  "scripts": {
+    "build": "shx rm -rf dist && rollup -c rollup.config.mjs",
+    "watch": "rollup -c rollup.config.mjs -w"
+  },
+  "keywords": [
+    "decky",
+    "plugin",
+    "steam-deck",
+    "parallax",
+    "gyroscope"
+  ],
+  "author": "GyroParallax Contributors",
+  "license": "BSD-3-Clause",
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^25.0.0",
+    "@rollup/plugin-json": "^6.0.0",
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "@rollup/plugin-replace": "^5.0.0",
+    "@rollup/plugin-typescript": "^11.0.0",
+    "@types/react": "^16.14.70",
+    "@types/react-dom": "^16.9.25",
+    "decky-frontend-lib": "^3.24.0",
+    "postcss": "^8.5.28",
+    "react": "^16.14.0",
+    "react-dom": "^16.14.0",
+    "rollup": "^3.0.0",
+    "rollup-plugin-import-assets": "^1.1.1",
+    "rollup-plugin-postcss": "^4.0.2",
+    "shx": "^0.3.4",
+    "tslib": "^2.8.1",
+    "typescript": "^5.0.0"
+  },
+  "pnpm": {
+    "peerDependencyRules": {
+      "allowedVersions": {
+        "react": "16",
+        "react-dom": "16"
+      }
+    }
+  }
+}
