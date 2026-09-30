@@ -1,7 +1,7 @@
 # Gyro Parallax
 
 **Плавный 3D-параллакс с управлением наклоном для страниц игр в библиотеке Steam Deck.**
-[![Baner](https://raw.githubusercontent.com/kuchazefira-hub/GyroParallax-Decky-plugin/refs/heads/main/Picture/GuroParallax.png)]
+[Baner](https://raw.githubusercontent.com/kuchazefira-hub/GyroParallax-Decky-plugin/refs/heads/main/Picture/GuroParallax.png)
 [![Steam Deck](https://img.shields.io/badge/Steam%20Deck-verified-1b2838?logo=steam)](https://store.steampowered.com/steamdeck)
 [![Decky Loader](https://img.shields.io/badge/Decky%20Loader-plugin-8a2be2)](https://github.com/SteamDeckHomebrew/decky-loader)
 [![Version](https://img.shields.io/badge/version-v1.0.0-blue)](package.json)
