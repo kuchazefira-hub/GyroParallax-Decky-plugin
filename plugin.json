@@ -1,0 +1,16 @@
+{
+  "name": "GyroParallax",
+  "author": "GyroParallax Contributors",
+  "flags": [
+    "debug"
+  ],
+  "publish": {
+    "tags": [
+      "visual",
+      "customization",
+      "game-details"
+    ],
+    "description": "Adds a smooth gyro-controlled 3D parallax effect to Steam Deck game pages.",
+    "image": "https://raw.githubusercontent.com/SteamDeckHomebrew/decky-loader/main/assets/logo_transparent.png"
+  }
+}
