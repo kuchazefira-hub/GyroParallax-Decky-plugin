@@ -79,6 +79,15 @@
   var SliderField = pick(['SliderField'], FbSlider);
   var ButtonItem = pick(['ButtonItem'], FbButton);
   var DropdownField = pick(['DropdownItem', 'DropdownField'], FbDropdown);
+  // Raw focusable button primitive (no Field/Focusable row wrapper like
+  // ButtonItem has). Used for the small square +/-/arrow controls: ButtonItem
+  // is designed to be the sole content of its own PanelSectionRow, and its
+  // focus/highlight ring is drawn against that full-width row rather than
+  // against the button itself, so shrinking the inner button to 44x44 via
+  // CSS left the highlight box its original (wider, left-shifted) size.
+  // DialogButton is a single focusable element with its own tightly-bound
+  // focus ring, so it stays in sync with the forced square size.
+  var DialogButton = pick(['DialogButton'], FbButton);
 
   function Boundary(props) {
     SP_REACT.Component.call(this, props);
@@ -114,12 +123,19 @@
     invertHorizontal: false,
     invertVertical: false,
     layerStrengths: { background: 0.25, middle: 0.5, foreground: 0.8, logo: 1.0 },
-    layerOpacity: { middle: 1.0, foreground: 1.0 },
-    layerTransform: { middle: { x: 0, y: 0, scale: 1 }, foreground: { x: 0, y: 0, scale: 1 } },
+    layerOpacity: { middle: 1.0, foreground: 1.0, background2: 1.0 },
+    layerTransform: { middle: { x: 0, y: 0, scale: 1 }, foreground: { x: 0, y: 0, scale: 1 }, background2: { x: 0, y: 0, scale: 1 } },
     logo: { x: 0, y: 0, scale: 1.0, opacity: 1.0, depth: 1.0 },
     calibration: { x: 0, y: 0 },
     mode: 'simple',
     images: {},
+    // When on, a second, independent background image (`background2`) is
+    // rendered between the real page background and the Middle layer, and
+    // takes over the "Фон: смещение" strength that would otherwise drive
+    // the real background - see applyOffset()/wantedLayerImage() for why
+    // the real background stops moving while this is on (avoids animating
+    // two full-screen layers with the same strength at once).
+    customBackground: false,
   };
 
   function cloneDefaultProfile() {
@@ -211,7 +227,7 @@
     this.lastDebugSample = null;
     this.lastRawSample = null;
     this.previewNudge = { x: 0, y: 0 };
-    this.layerImages = { middle: null, foreground: null, logo: null };
+    this.layerImages = { middle: null, foreground: null, logo: null, background2: null };
     this.setLayerImage = function () {};
     this.previewOpen = false;
     this.heroBoxSize = null;
@@ -443,7 +459,7 @@
       var targetId = state.currentAppId;
       if (!targetId) return;
       Backend.deleteProfile(serverAPI, targetId).then(function () {
-        state.layerImages = { middle: null, foreground: null };
+        state.layerImages = { middle: null, foreground: null, logo: null, background2: null };
         return Backend.getGlobalSettings(serverAPI);
       }).then(function (global) {
         var next = Object.assign(cloneDefaultProfile(), global || {});
@@ -462,7 +478,7 @@
 
     function row(child) { return h(PanelSectionRow, null, child); }
 
-    var LAYER_LABELS = { background: 'Фон', middle: 'Средний план', foreground: 'Передний план', logo: 'Логотип' };
+    var LAYER_LABELS = { background: 'Фон', background2: 'Дополнительный фон', middle: 'Средний план', foreground: 'Передний план', logo: 'Логотип' };
 
     function openBrowser(layer, startPath) {
       Backend.listDir(serverAPI, startPath || '').then(function (listing) {
@@ -558,8 +574,6 @@
     ];
 
     var settingsRows = [
-      row(h(InfoField, { key: 'scope', label: 'Профиль' },
-        isGameScoped ? ('эта игра (' + appid + ')') : 'глобальный')),
       row(h(ToggleField, {
         key: 'enable', label: 'Включить параллакс', checked: profile.enabled,
         onChange: function (v) { update('enabled', v); },
@@ -568,8 +582,6 @@
         key: 'preset', label: 'Пресет', rgOptions: PRESET_OPTIONS, selectedOption: profile.preset,
         onChange: function (opt) { applyPreset(String(opt.data)); },
       })),
-      !isGameScoped ? row(h(InfoField, { key: 'scopehint', label: 'Совет' },
-        'Откройте страницу игры, чтобы настроить профиль отдельно для неё.')) : null,
     ].concat(subGroup('displacement', 'Смещение', displacementRows), [
       row(h(SliderField, {
         key: 'sens', label: 'Чувствительность', value: profile.sensitivity, min: 0, max: 100, step: 1, showValue: true,
@@ -665,15 +677,15 @@
         }, [
           h('span', { style: { fontSize: '0.9em', opacity: 0.85, fontWeight: '500' } }, 'Размер:'),
           h('div', { className: 'gp-square-btn-wrap' },
-            h(ButtonItem, {
-              key: 'minus', layout: 'inline', className: 'gp-square-btn',
+            h(DialogButton, {
+              key: 'minus', className: 'gp-square-btn',
               style: squareBtnStyle,
               onClick: function () { scaleLayerBy(layer, -SCALE_STEP); }
             }, '−')
           ),
           h('div', { className: 'gp-square-btn-wrap' },
-            h(ButtonItem, {
-              key: 'plus', layout: 'inline', className: 'gp-square-btn',
+            h(DialogButton, {
+              key: 'plus', className: 'gp-square-btn',
               style: squareBtnStyle,
               onClick: function () { scaleLayerBy(layer, SCALE_STEP); }
             }, '+')
@@ -688,29 +700,29 @@
           style: { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px', margin: '4px 0' }
         }, [
           h('div', { className: 'gp-square-btn-wrap' },
-            h(ButtonItem, {
-              key: 'u', layout: 'inline', className: 'gp-square-btn',
+            h(DialogButton, {
+              key: 'u', className: 'gp-square-btn',
               style: squareBtnStyle,
               onClick: function () { moveLayerBy(layer, 0, -POSITION_STEP); }
             }, '↑')
           ),
           h('div', { className: 'gp-square-btn-wrap' },
-            h(ButtonItem, {
-              key: 'd', layout: 'inline', className: 'gp-square-btn',
+            h(DialogButton, {
+              key: 'd', className: 'gp-square-btn',
               style: squareBtnStyle,
               onClick: function () { moveLayerBy(layer, 0, POSITION_STEP); }
             }, '↓')
           ),
           h('div', { className: 'gp-square-btn-wrap' },
-            h(ButtonItem, {
-              key: 'l', layout: 'inline', className: 'gp-square-btn',
+            h(DialogButton, {
+              key: 'l', className: 'gp-square-btn',
               style: squareBtnStyle,
               onClick: function () { moveLayerBy(layer, -POSITION_STEP, 0); }
               }, '←')
           ),
           h('div', { className: 'gp-square-btn-wrap' },
-            h(ButtonItem, {
-              key: 'r', layout: 'inline', className: 'gp-square-btn',
+            h(DialogButton, {
+              key: 'r', className: 'gp-square-btn',
               style: squareBtnStyle,
               onClick: function () { moveLayerBy(layer, POSITION_STEP, 0); }
             }, '→')
@@ -743,9 +755,21 @@
       return rows;
     }
 
+    var customBgEnabled = !!profile.customBackground;
     var backgroundRows = [
       row(h(InfoField, { key: 'bg_info', label: 'Информация' }, 'Основной фон со страницы игры')),
+      row(h(ToggleField, {
+        key: 'bg_custom', label: 'Кастом', checked: customBgEnabled,
+        onChange: function (v) { update('customBackground', v); },
+      })),
     ];
+    if (customBgEnabled) {
+      backgroundRows.push(row(h(InfoField, { key: 'bg2_info', label: 'Доп. фон' },
+        'Слой поверх основного фона, но ниже остальных. Наследует смещение ' +
+        'основного фона (ползунок «Фон: смещение»); пока этот слой включён, ' +
+        'сам основной фон параллакс-эффект не получает.')));
+      backgroundRows.push.apply(backgroundRows, customLayerRows('background2'));
+    }
     var middleRows = customLayerRows('middle');
     var foregroundRows = customLayerRows('foreground');
     var logoRows = [
@@ -766,10 +790,6 @@
       row(h(InfoField, { key: 'tip', label: 'Подсказка' },
         'Держите Steam Deck в обычном игровом положении и нажмите «Калибровать».')),
       row(h(ButtonItem, { key: 'reset', layout: 'below', onClick: resetCalibration }, 'Сбросить калибровку')),
-      row(h(ToggleField, {
-        key: 'dbg', label: 'Отладочная информация', checked: debug,
-        onChange: function (v) { setDebug(v); state.debugEnabled = v; state.notify(); },
-      })),
     ];
     if (debug) {
       calibRows.push(row(h(InfoField, { key: 'gx', label: 'Наклон X (0.1°)' }, debugSample ? debugSample.rawX.toFixed(3) : '-')));
@@ -784,15 +804,39 @@
         debugSample && debugSample.available ? 'доступен' : ('недоступен' + (state.gyroReason ? ' (' + state.gyroReason + ')' : '')))));
     }
 
+    var scopeRow = row(h(InfoField, { key: 'scope', label: 'Профиль' },
+      isGameScoped ? ('эта игра (' + appid + ')') : 'глобальный'));
+
+    var debugToggleRow = row(h(ToggleField, {
+      key: 'dbg', label: 'Отладочная информация', checked: debug,
+      onChange: function (v) { setDebug(v); state.debugEnabled = v; state.notify(); },
+    }));
+
     var banner = h('img', {
       key: 'banner', src: BANNER_DATA_URI, alt: 'GyroParallax',
-      style: { width: '100%', display: 'block', borderRadius: '8px', marginBottom: '8px' },
+      title: 'Открыть приветственный экран',
+      style: { width: '100%', display: 'block', borderRadius: '8px', marginBottom: '8px', cursor: 'pointer' },
+      onClick: function () { if (state.openWelcome) state.openWelcome(); },
     });
 
-    var allRows = [banner]
-      .concat(group('settings', 'Настройка', settingsRows))
-      .concat(group('layers', 'Слои', layersRows))
-      .concat(group('calibration', 'Калибровка гироскопа', calibRows));
+    var allRows;
+    if (!isGameScoped) {
+      var notice = row(h('div', {
+        key: 'nogame',
+        style: {
+          border: '1px solid rgba(255,255,255,0.25)', borderRadius: '8px',
+          padding: '12px', margin: '4px 0', textAlign: 'center',
+          fontSize: '0.9em', opacity: 0.85, lineHeight: 1.4,
+        },
+      }, 'Перейдите на страницу игры, чтобы настроить плагин.'));
+      allRows = [banner, scopeRow, notice];
+    } else {
+      allRows = [banner, scopeRow]
+        .concat(group('settings', 'Настройка', settingsRows))
+        .concat(group('layers', 'Слои', layersRows))
+        .concat(group('calibration', 'Калибровка гироскопа', calibRows))
+        .concat([debugToggleRow]);
+    }
 
     return h(PanelSection, null, allRows);
   }
@@ -853,9 +897,11 @@
       d.style.zIndex = zIndex;
       return d;
     }
+    var background2Div = makeLayerDiv('5');
     var middleDiv = makeLayerDiv('10');
     var foregroundDiv = makeLayerDiv('20');
     var logoDiv = makeLayerDiv('30');
+    root.appendChild(background2Div);
     root.appendChild(middleDiv);
     root.appendChild(foregroundDiv);
     root.appendChild(logoDiv);
@@ -876,7 +922,7 @@
     hint.style.zIndex = '40';
     root.appendChild(hint);
 
-    return { root: root, middleDiv: middleDiv, foregroundDiv: foregroundDiv, logoDiv: logoDiv, hint: hint };
+    return { root: root, background2Div: background2Div, middleDiv: middleDiv, foregroundDiv: foregroundDiv, logoDiv: logoDiv, hint: hint };
   }
 
   var lastPreviewRenderKey = null;
@@ -901,9 +947,12 @@
     var lg = profile.logo || DEFAULT_PROFILE.logo;
     var opMid = (profile.layerOpacity && profile.layerOpacity.middle != null) ? profile.layerOpacity.middle : 1;
     var opFore = (profile.layerOpacity && profile.layerOpacity.foreground != null) ? profile.layerOpacity.foreground : 1;
+    var opBg2 = (profile.layerOpacity && profile.layerOpacity.background2 != null) ? profile.layerOpacity.background2 : 1;
     var midImg = state.layerImages && state.layerImages.middle;
     var foreImg = state.layerImages && state.layerImages.foreground;
     var logoImg = (state.layerImages && state.layerImages.logo) || state.logoPreviewSrc;
+    var bg2Enabled = !!profile.customBackground;
+    var bg2Img = bg2Enabled && state.layerImages && state.layerImages.background2;
     var rel = state.logoRelBox;
 
     var renderKey = [
@@ -913,10 +962,12 @@
       (midImg || ''),
       (foreImg || ''),
       (logoImg || ''),
+      (bg2Enabled ? '1:' + (bg2Img || '') : '0'),
       (lt && lt.middle ? (lt.middle.x + ',' + lt.middle.y + ',' + lt.middle.scale) : ''),
       (lt && lt.foreground ? (lt.foreground.x + ',' + lt.foreground.y + ',' + lt.foreground.scale) : ''),
+      (lt && lt.background2 ? (lt.background2.x + ',' + lt.background2.y + ',' + lt.background2.scale) : ''),
       (lg ? (lg.x + ',' + lg.y + ',' + lg.scale + ',' + lg.opacity) : ''),
-      opMid, opFore,
+      opMid, opFore, opBg2,
       (rel ? (rel.left.toFixed(3) + ',' + rel.top.toFixed(3) + ',' + rel.width.toFixed(3) + ',' + rel.height.toFixed(3)) : '')
     ].join('|');
 
@@ -929,6 +980,7 @@
       dom.hint.style.display = 'flex';
       dom.middleDiv.style.display = 'none';
       dom.foregroundDiv.style.display = 'none';
+      if (dom.background2Div) dom.background2Div.style.display = 'none';
       if (dom.logoDiv) dom.logoDiv.style.display = 'none';
       var aspect0 = PREVIEW_FALLBACK_ASPECT;
       var width0 = PREVIEW_WIDTH;
@@ -958,6 +1010,7 @@
       div.style.transform = 'translate(' + (t.x * scaleFactor).toFixed(2) + 'px, ' + (t.y * scaleFactor).toFixed(2) + 'px) scale(' + t.scale + ')';
       div.style.transformOrigin = 'center';
     }
+    if (dom.background2Div) applyLayer(dom.background2Div, bg2Img, lt && lt.background2, opBg2);
     applyLayer(dom.middleDiv, midImg, lt && lt.middle, opMid);
     applyLayer(dom.foregroundDiv, foreImg, lt && lt.foreground, opFore);
 
@@ -993,6 +1046,134 @@
         dom.logoDiv.style.display = 'none';
       }
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // One-time (and re-openable) full-screen welcome screen.
+  //
+  // Built with plain DOM appended to the real Steam window's document (same
+  // reasoning as buildPreviewDom above: this plugin module's own React
+  // instance lives in the Quick Access Menu's popup realm, not the real
+  // game-mode window, so a plain DOM overlay is the reliable way to cover
+  // the whole screen rather than something React-rendered inside the QAM).
+  // ---------------------------------------------------------------------
+  var WELCOME_TEXT_HTML =
+    '<h2 style="margin:0 0 14px;font-size:1.3em;">Добро пожаловать в GyroParallax!</h2>' +
+    '<p>Спасибо, что установили этот экспериментальный плагин — насколько мне известно, ' +
+    'единственный в своём роде для Steam Deck. Он полностью создан в тандеме с ' +
+    'AI-ассистентами: я не программист, а по-настоящему увлечённых энтузиастов, готовых ' +
+    'довести подобную идею до рабочего состояния, можно пересчитать по пальцам. Мы вместе ' +
+    'провели немало дней и ночей за анализом, доработками и полировкой кода — не только ' +
+    'ради самой идеи, но и ради того, чтобы пользоваться плагином было по-настоящему ' +
+    'удобно. Спасибо за доверие и за то, что решили попробовать!</p>' +
+    '<h3 style="margin:22px 0 10px;font-size:1.1em;">Что умеет плагин</h3>' +
+    '<p>GyroParallax добавляет на страницу игры в библиотеке лёгкий 3D-эффект параллакса: ' +
+    'при наклоне Steam Deck фон, средний план, передний план и логотип игры смещаются с ' +
+    'разной силой, создавая ощущение объёма — как будто смотришь на слегка приподнятую ' +
+    'карточку, а не просто на картинку.</p>' +
+    '<ul style="margin:0 0 14px;padding-left:1.2em;">' +
+    '<li style="margin-bottom:10px;"><b>Слои с глубиной.</b> Основной фон — это родная ' +
+    'обложка игры из Steam; поверх неё можно добавить свои изображения для среднего и ' +
+    'переднего плана (например, вырезанного персонажа), а также второй, дополнительный ' +
+    'фоновый слой — у каждого свои прозрачность, размер и позиция.</li>' +
+    '<li style="margin-bottom:10px;"><b>Наклон вместо тряски.</b> Эффект считывается с ' +
+    'акселерометра самих Joy-контроллеров Deck, сглаживается и ограничивается, чтобы ' +
+    'движение было плавным и не укачивало.</li>' +
+    '<li style="margin-bottom:10px;"><b>Профили под каждую игру.</b> Настройки, ' +
+    'изменённые на странице конкретной игры, сохраняются только для неё; всё, что ' +
+    'меняется без открытой игры, становится общим значением по умолчанию для всех ' +
+    'остальных игр.</li>' +
+    '<li style="margin-bottom:10px;"><b>Готовые пресеты и тонкая настройка.</b> Быстрый ' +
+    'выбор между «Лёгким», «Кинематографичным» и «Сильным» эффектом или ручная настройка ' +
+    'чувствительности, сглаживания, мёртвой зоны и инверсии осей.</li>' +
+    '<li style="margin-bottom:10px;"><b>Живое превью.</b> Прямо в панели настроек можно ' +
+    'увидеть, как будут выглядеть выбранные изображения и их положение — без ' +
+    'необходимости тянуться к самому Deck и наклонять его.</li>' +
+    '<li style="margin-bottom:10px;"><b>Калибровка под свой хват.</b> Одна кнопка ' +
+    'запоминает, как вы обычно держите Deck, и центрирует эффект относительно этого ' +
+    'положения.</li>' +
+    '<li><b>Отладочная информация</b> — для тех, кому интересно заглянуть «под капот»: ' +
+    'показания датчика, FPS, найденные на странице элементы.</li>' +
+    '</ul>' +
+    '<p style="margin:0;">Чтобы начать — просто откройте страницу любой игры в ' +
+    'библиотеке и загляните в панель плагина через быстрое меню: там всё разложено по ' +
+    'понятным разделам, и без открытой страницы игры плагин сразу подскажет, что нужно ' +
+    'сделать.</p>';
+
+  function buildWelcomeDom(doc, onThanks) {
+    var root = doc.createElement('div');
+    root.id = 'gyroparallax-welcome-root';
+    root.setAttribute('data-gp-preview', 'true'); // also excluded from hero/logo scanning
+    // Focusable (but not via Tab, hence -1) so we can force real DOM focus
+    // onto it right after it opens - see focusWelcomeRoot() in pluginFactory.
+    // Plain divs aren't part of Steam's own gamepad-navigation tree, so this
+    // is what lets *anything* (native scroll-on-focused-element behavior,
+    // our own keydown listener) actually reach this overlay at all.
+    root.setAttribute('tabindex', '-1');
+    root.style.position = 'fixed';
+    root.style.inset = '0';
+    root.style.zIndex = '2147483647';
+    root.style.background = 'rgba(10, 11, 14, 0.94)';
+    root.style.display = 'flex';
+    root.style.flexDirection = 'column';
+    root.style.alignItems = 'center';
+    root.style.overflowY = 'auto';
+    root.style.padding = '4vh 16px';
+    root.style.boxSizing = 'border-box';
+    root.style.pointerEvents = 'auto';
+    root.style.color = '#f1f1f4';
+    root.style.fontFamily = 'inherit';
+    root.style.outline = 'none';
+
+    var card = doc.createElement('div');
+    card.style.width = '100%';
+    card.style.maxWidth = '720px';
+    card.style.margin = 'auto';
+    card.style.background = '#1a1c23';
+    card.style.border = '1px solid rgba(255,255,255,0.12)';
+    card.style.borderRadius = '14px';
+    card.style.boxShadow = '0 8px 32px rgba(0,0,0,0.6)';
+    card.style.padding = '24px 28px 28px';
+    card.style.boxSizing = 'border-box';
+    root.appendChild(card);
+
+    var banner = doc.createElement('img');
+    banner.src = BANNER_DATA_URI;
+    banner.alt = 'GyroParallax';
+    banner.style.width = '100%';
+    banner.style.display = 'block';
+    banner.style.borderRadius = '10px';
+    banner.style.marginBottom = '18px';
+    card.appendChild(banner);
+
+    var textBox = doc.createElement('div');
+    textBox.style.fontSize = '15px';
+    textBox.style.lineHeight = '1.55';
+    textBox.innerHTML = WELCOME_TEXT_HTML;
+    card.appendChild(textBox);
+
+    var btnWrap = doc.createElement('div');
+    btnWrap.style.display = 'flex';
+    btnWrap.style.justifyContent = 'center';
+    btnWrap.style.marginTop = '24px';
+    card.appendChild(btnWrap);
+
+    var btn = doc.createElement('button');
+    btn.textContent = 'Спасибо!';
+    btn.style.font = 'inherit';
+    btn.style.fontWeight = '700';
+    btn.style.fontSize = '16px';
+    btn.style.padding = '12px 40px';
+    btn.style.borderRadius = '999px';
+    btn.style.border = 'none';
+    btn.style.cursor = 'pointer';
+    btn.style.color = '#101317';
+    btn.style.background = 'linear-gradient(135deg, #7fe0c8, #5bb8e0)';
+    btn.style.boxShadow = '0 4px 14px rgba(91, 184, 224, 0.4)';
+    btn.onclick = function () { if (onThanks) onThanks(); };
+    btnWrap.appendChild(btn);
+
+    return { root: root };
   }
 
   // ---------------------------------------------------------------------
@@ -1075,9 +1256,200 @@
     });
     ensurePreviewMounted();
 
+    // -----------------------------------------------------------------
+    // Welcome screen: purely manual - opened only by clicking the plugin's
+    // own banner in its Quick Access Menu panel (see state.openWelcome,
+    // wired up in SettingsPanel). No auto-show on install/startup/version
+    // change; nothing is persisted about whether it's been seen before.
+    //
+    // Two things this overlay has to fight to actually look "full screen":
+    //  1. The Quick Access Menu (the right-hand "shade") is Steam's own UI
+    //     layer, not part of this document's normal stacking order - no
+    //     z-index on our side can render above it. So whenever we show the
+    //     welcome screen we also ask Steam to close it via
+    //     Navigation.CloseSideMenus(), the same call Steam/plugins use to
+    //     get a fullscreen overlay to actually cover the whole screen.
+    //     Closing it unmounts this plugin's own QAM panel (onDismount runs)
+    //     - deliberately harmless here since the welcome overlay lives in
+    //     the real window's document (via getDoc()), completely independent
+    //     of this panel's own React tree, so it stays on screen regardless.
+    //  2. It isn't part of Steam's own gamepad focus-navigation tree (it's
+    //     plain DOM, not one of Steam's Focusable components), so D-pad/
+    //     stick input wouldn't normally reach it at all. Instead we poll the
+    //     standard Gamepad API directly while it's open: left stick/D-pad to
+    //     scroll, and the bottom face button (A) to confirm - plus a keydown
+    //     listener as a free fallback for keyboard/anything that does
+    //     translate to real key events.
+    // -----------------------------------------------------------------
+    var welcomeDom = null;
+    var welcomeGamepadTimer = null;
+    var welcomeGamepadTimerWin = null;
+    var welcomeGamepadPrevConfirm = false;
+    var welcomeKeydownDoc = null;
+
+    function getWin() {
+      try {
+        var sp = DFL && DFL.findSP && DFL.findSP();
+        if (sp) return sp;
+      } catch (e) {}
+      return window;
+    }
+
+    function closeSideMenusIfPossible() {
+      try {
+        var nav = DFL && DFL.Navigation;
+        if (nav && typeof nav.CloseSideMenus === 'function') nav.CloseSideMenus();
+      } catch (e) {}
+    }
+
+    // Plain DOM isn't part of Steam's own gamepad focus-navigation tree, so
+    // nothing routes D-pad/stick input to it by default - and if some other
+    // (now-hidden, since we just closed the side menu) element still holds
+    // real DOM focus, several input paths simply have nowhere to go. Forcing
+    // real focus onto the overlay itself, and re-asserting it if something
+    // steals it back, is what lets the native "focused scrollable element
+    // reacts to Up/Down/PageUp/PageDown" behavior (and our own keydown
+    // listener below) actually receive anything at all.
+    function focusWelcomeRoot() {
+      if (!welcomeDom || !welcomeDom.root) return;
+      try {
+        if (welcomeDom.root.tabIndex == null || welcomeDom.root.tabIndex < 0) welcomeDom.root.tabIndex = -1;
+        if (welcomeDom.root.ownerDocument && welcomeDom.root.ownerDocument.activeElement !== welcomeDom.root) {
+          welcomeDom.root.focus({ preventScroll: true });
+        }
+      } catch (e) {}
+    }
+
+    function onWelcomeKeydown(e) {
+      if (!welcomeDom || !welcomeDom.root) return;
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        dismissWelcome();
+      } else if (e.key === 'ArrowDown') {
+        welcomeDom.root.scrollTop += 60;
+      } else if (e.key === 'ArrowUp') {
+        welcomeDom.root.scrollTop -= 60;
+      } else if (e.key === 'PageDown') {
+        welcomeDom.root.scrollTop += 300;
+      } else if (e.key === 'PageUp') {
+        welcomeDom.root.scrollTop -= 300;
+      }
+    }
+
+    function stopWelcomeGamepadLoop() {
+      if (welcomeGamepadTimer) {
+        // Must clear via the *same* window object that scheduled it - timer
+        // ids are only meaningful within the realm that issued them, and
+        // calling the wrong realm's clearInterval with a numerically
+        // coincidental id could cancel an unrelated timer (e.g. the game
+        // page poll loop) instead of doing nothing.
+        try { ((welcomeGamepadTimerWin && welcomeGamepadTimerWin.clearInterval) ? welcomeGamepadTimerWin : window).clearInterval(welcomeGamepadTimer); } catch (e) {}
+      }
+      welcomeGamepadTimer = null;
+      welcomeGamepadTimerWin = null;
+    }
+    function startWelcomeGamepadLoop() {
+      if (welcomeGamepadTimer) return;
+      welcomeGamepadPrevConfirm = false;
+      // Scheduled on the *real, visible* window rather than this plugin's
+      // own popup/QAM realm: once we close the side menu (see
+      // closeSideMenusIfPossible above) that realm can end up backgrounded/
+      // hidden, and browsers throttle timers in hidden documents heavily -
+      // which looked like "the window isn't responding to input" even
+      // though the overlay itself was still visible. The main window stays
+      // visible/focused the whole time, so its timers keep running normally.
+      var win = getWin();
+      welcomeGamepadTimerWin = win;
+      var scheduleInterval = (win && typeof win.setInterval === 'function') ? win.setInterval.bind(win) : setInterval;
+      welcomeGamepadTimer = scheduleInterval(function () {
+        if (!welcomeDom || !welcomeDom.root || !welcomeDom.root.isConnected) { stopWelcomeGamepadLoop(); return; }
+        focusWelcomeRoot();
+        try {
+          var padLists = [];
+          if (win && win.navigator && win.navigator.getGamepads) padLists.push(win.navigator.getGamepads());
+          if (typeof navigator !== 'undefined' && navigator.getGamepads &&
+              (!win || navigator !== win.navigator)) padLists.push(navigator.getGamepads());
+          var confirmPressed = false;
+          for (var li = 0; li < padLists.length; li++) {
+            var pads = padLists[li];
+            if (!pads) continue;
+            for (var i = 0; i < pads.length; i++) {
+              var gp = pads[i];
+              if (!gp) continue;
+              var axisY = (gp.axes && gp.axes.length > 1) ? gp.axes[1] : 0;
+              if (Math.abs(axisY) > 0.2) welcomeDom.root.scrollTop += axisY * 18;
+              if (gp.buttons[12] && gp.buttons[12].pressed) welcomeDom.root.scrollTop -= 12;
+              if (gp.buttons[13] && gp.buttons[13].pressed) welcomeDom.root.scrollTop += 12;
+              if (gp.buttons[0] && gp.buttons[0].pressed) confirmPressed = true;
+            }
+          }
+          if (confirmPressed && !welcomeGamepadPrevConfirm) dismissWelcome();
+          welcomeGamepadPrevConfirm = confirmPressed;
+        } catch (e) {}
+      }, 33);
+    }
+
+    function dismissWelcome() {
+      if (welcomeDom && welcomeDom.root && welcomeDom.root.parentNode) {
+        welcomeDom.root.parentNode.removeChild(welcomeDom.root);
+      }
+      welcomeDom = null;
+      stopWelcomeGamepadLoop();
+      if (welcomeKeydownDoc) {
+        try { welcomeKeydownDoc.removeEventListener('keydown', onWelcomeKeydown, true); } catch (e) {}
+        welcomeKeydownDoc = null;
+      }
+    }
+    function showWelcome() {
+      var doc = getDoc();
+      if (!doc || !doc.body) return;
+      var existing = doc.getElementById && doc.getElementById('gyroparallax-welcome-root');
+      if (existing) {
+        welcomeDom = { root: existing };
+      } else {
+        welcomeDom = buildWelcomeDom(doc, dismissWelcome);
+        doc.body.appendChild(welcomeDom.root);
+      }
+      startWelcomeGamepadLoop();
+      try {
+        doc.addEventListener('keydown', onWelcomeKeydown, true);
+        welcomeKeydownDoc = doc;
+      } catch (e) {}
+      focusWelcomeRoot();
+      closeSideMenusIfPossible();
+      // Closing the side menu can shift focus around as part of its own
+      // teardown/animation; re-grab it shortly after so the overlay ends up
+      // holding focus once that settles, instead of racing it.
+      var win = getWin();
+      var scheduleTimeout = (win && typeof win.setTimeout === 'function') ? win.setTimeout.bind(win) : setTimeout;
+      scheduleTimeout(focusWelcomeRoot, 60);
+      scheduleTimeout(focusWelcomeRoot, 350);
+    }
+    // Only ever opened manually, by clicking the plugin's own banner in its
+    // Quick Access Menu panel (see the banner's onClick in SettingsPanel) -
+    // deliberately no auto-show on install/startup/version change.
+    state.openWelcome = showWelcome;
+
     var overlayVisible = false;
-    var targets = { hero: [], logo: [], middle: [], foreground: [] };
-    var layerNodes = { middle: null, foreground: null };
+    var targets = { hero: [], logo: [], middle: [], foreground: [], background2: [] };
+    var layerNodes = { middle: null, foreground: null, background2: null };
+    // Custom layers, in the order they should stack visually above the real
+    // page background: background2 sits just above it, then middle, then
+    // foreground (Logo is handled separately - it's Steam's own detected
+    // logo element, always kept on top via its own z-index). Also used to
+    // find the right DOM anchor to insertBefore/after when (re)building a
+    // layer node, so the actual DOM order matches the intended stack even
+    // though z-index alone would already guarantee the visual order.
+    var CUSTOM_LAYER_ORDER = ['background2', 'middle', 'foreground'];
+    var CUSTOM_LAYER_ZINDEX = { background2: '2', middle: '5', foreground: '10' };
+    function anchorNodeFor(layer, heroEl) {
+      var idx = CUSTOM_LAYER_ORDER.indexOf(layer);
+      for (var i = idx - 1; i >= 0; i--) {
+        var prevNode = layerNodes[CUSTOM_LAYER_ORDER[i]];
+        if (prevNode && prevNode.parentNode === heroEl.parentNode) return prevNode;
+      }
+      return heroEl;
+    }
     var applied = false;
     var lastHeroKey = null;
 
@@ -1092,6 +1464,7 @@
     function wantedLayerImage(layer) {
       var p = state.currentProfile;
       if (!overlayVisible || !p || !p.enabled) return null;
+      if (layer === 'background2' && !p.customBackground) return null;
       return state.layerImages[layer] || null;
     }
 
@@ -1149,7 +1522,7 @@
         if (!/blur/i.test(s)) { heroEl = heroList[i]; break; }
       }
       if (!heroEl && heroList.length) heroEl = heroList[0];
-      var sizeInfo = { hero: null, middle: null, foreground: null };
+      var sizeInfo = { hero: null, middle: null, foreground: null, background2: null };
       if (heroEl) {
         sizeInfo.hero = heroEl.offsetWidth + 'x' + heroEl.offsetHeight;
         state.heroBoxSize = { w: heroEl.offsetWidth, h: heroEl.offsetHeight };
@@ -1158,7 +1531,7 @@
         state.heroBoxSize = null;
         state.heroPreviewSrc = null;
       }
-      ['middle', 'foreground'].forEach(function (layer) {
+      CUSTOM_LAYER_ORDER.forEach(function (layer) {
         var src = wantedLayerImage(layer);
         var node = layerNodes[layer];
         if (!src || !heroEl || !heroEl.parentNode) { removeLayerNode(layer); return; }
@@ -1166,9 +1539,7 @@
         if (node && node.isConnected && node.__gpSrc === src) {
           node.__gpHero = heroEl;
           if (heroEl.parentNode && node.parentNode !== heroEl.parentNode) {
-            var reAnchor = heroEl;
-            if (layer === 'foreground' && layerNodes.middle && layerNodes.middle.parentNode === heroEl.parentNode) reAnchor = layerNodes.middle;
-            heroEl.parentNode.insertBefore(node, reAnchor.nextSibling);
+            heroEl.parentNode.insertBefore(node, anchorNodeFor(layer, heroEl).nextSibling);
           }
           positionLayerNode(node, heroEl);
           sizeInfo[layer] = describeLayerSize(node);
@@ -1199,15 +1570,15 @@
         node.style.backdropFilter = 'none';
         node.style.backgroundColor = 'transparent';
         node.style.pointerEvents = 'none';
-        // Middle layer (z-index 5) and Foreground layer (z-index 10) - strictly below Logo (z-index 50)
-        node.style.zIndex = layer === 'foreground' ? '10' : '5';
+        // background2 (z-index 2, just above the real page background) <
+        // Middle (z-index 5) < Foreground (z-index 10) - all strictly below
+        // Logo (z-index 50).
+        node.style.zIndex = CUSTOM_LAYER_ZINDEX[layer] || '5';
         applyBaseTransform(node, layer);
         node.style.opacity = String(layerOpacityOf(layer));
         node.__gpSrc = src;
         node.__gpHero = heroEl;
-        var anchor = heroEl;
-        if (layer === 'foreground' && layerNodes.middle && layerNodes.middle.parentNode === heroEl.parentNode) anchor = layerNodes.middle;
-        heroEl.parentNode.insertBefore(node, anchor.nextSibling);
+        heroEl.parentNode.insertBefore(node, anchorNodeFor(layer, heroEl).nextSibling);
         positionLayerNode(node, heroEl);
         layerNodes[layer] = node;
         sizeInfo[layer] = describeLayerSize(node);
@@ -1231,7 +1602,7 @@
 
     function updateLayerStyles() {
       var needScan = false;
-      ['middle', 'foreground'].forEach(function (layer) {
+      CUSTOM_LAYER_ORDER.forEach(function (layer) {
         var node = layerNodes[layer];
         var want = wantedLayerImage(layer);
         if ((want || null) !== (node ? node.__gpSrc : null)) needScan = true;
@@ -1358,10 +1729,12 @@
         hero: hero, logo: logo,
         middle: layerNodes.middle ? [layerNodes.middle] : [],
         foreground: layerNodes.foreground ? [layerNodes.foreground] : [],
+        background2: layerNodes.background2 ? [layerNodes.background2] : [],
       };
       state.debugTargets = 'hero ' + hero.length + ', logo ' + logo.length + ', imgs ' + imgs.length +
         (doc === document ? ' (plugin doc)' : ' (SP doc)') + (hero.length + logo.length ? '' : ' e.g. ' + sample.join(' | '));
       state.debugSizes = 'box(hero) ' + (sizeInfo.hero || '-') +
+        ' | bg2 ' + (sizeInfo.background2 || '-') +
         ' | middle ' + (sizeInfo.middle || '-') +
         ' | foreground ' + (sizeInfo.foreground || '-');
 
@@ -1383,14 +1756,23 @@
       var st = p.layerStrengths || DEFAULT_PROFILE.layerStrengths;
       var lg = p.logo || DEFAULT_PROFILE.logo;
       var overscan = overscanScaleFor(p.maxDisplacement);
+      // While the custom background2 layer is active, the real page
+      // background stops moving - both are full-bleed layers, so animating
+      // both at once would double the work for a look the user can already
+      // get from background2 alone (see wantedLayerImage()/customBackground).
+      var bgActive = p.customBackground && wantedLayerImage('background2');
+      var bgStrength = bgActive ? 0 : st.background;
       eachEl(targets.hero, function (el) {
-        el.style.translate = (x * st.background).toFixed(2) + 'px ' + (y * st.background).toFixed(2) + 'px';
+        el.style.translate = (x * bgStrength).toFixed(2) + 'px ' + (y * bgStrength).toFixed(2) + 'px';
         el.style.scale = String(overscan);
       });
-      ['middle', 'foreground'].forEach(function (layer) {
+      CUSTOM_LAYER_ORDER.forEach(function (layer) {
         var t = layerTransformOf(layer);
+        // background2 borrows the main background's own strength slider
+        // rather than getting a separate one - see the "Кастом" toggle note.
+        var strength = layer === 'background2' ? st.background : st[layer];
         eachEl(targets[layer], function (el) {
-          el.style.translate = (x * st[layer] + t.x).toFixed(2) + 'px ' + (y * st[layer] + t.y).toFixed(2) + 'px';
+          el.style.translate = (x * strength + t.x).toFixed(2) + 'px ' + (y * strength + t.y).toFixed(2) + 'px';
           el.style.scale = String(overscan * t.scale);
         });
       });
@@ -1419,7 +1801,7 @@
           el.style.zIndex = '50';
         });
       }
-      ['middle', 'foreground'].forEach(function (layer) {
+      CUSTOM_LAYER_ORDER.forEach(function (layer) {
         eachEl(targets[layer], function (el) { applyBaseTransform(el, layer); });
       });
     }
@@ -1466,14 +1848,15 @@
       clearOffset();
       removeLayerNode('middle');
       removeLayerNode('foreground');
-      targets = { hero: [], logo: [], middle: [], foreground: [] };
+      removeLayerNode('background2');
+      targets = { hero: [], logo: [], middle: [], foreground: [], background2: [] };
       state.currentAppId = appid;
       state.heroBoxSize = null;
       state.heroPreviewSrc = null;
       state.logoPreviewSrc = null;
       state.logoRelBox = null;
       lastHeroKey = null;
-      state.layerImages = { middle: null, foreground: null, logo: null };
+      state.layerImages = { middle: null, foreground: null, logo: null, background2: null };
       state.notify();
 
       Promise.all([
@@ -1481,15 +1864,16 @@
         loadLayerImage(appid, 'middle'),
         loadLayerImage(appid, 'foreground'),
         loadLayerImage(appid, 'logo'),
+        loadLayerImage(appid, 'background2'),
         Backend.getArtwork(serverApi, appid),
       ]).then(function (res) {
         if (state.currentAppId !== appid) return null;
         state.currentProfile = Object.assign(cloneDefaultProfile(), res[0] || {});
-        state.layerImages = { middle: res[1] || null, foreground: res[2] || null, logo: res[3] || null };
-        if (res[4]) {
-          if (!state.logoPreviewSrc && res[4].logo) state.logoPreviewSrc = res[4].logo;
-          if (!state.heroPreviewSrc && (res[4].background || res[4].foreground)) {
-            state.heroPreviewSrc = res[4].background || res[4].foreground;
+        state.layerImages = { middle: res[1] || null, foreground: res[2] || null, logo: res[3] || null, background2: res[4] || null };
+        if (res[5]) {
+          if (!state.logoPreviewSrc && res[5].logo) state.logoPreviewSrc = res[5].logo;
+          if (!state.heroPreviewSrc && (res[5].background || res[5].foreground)) {
+            state.heroPreviewSrc = res[5].background || res[5].foreground;
           }
         }
         overlayVisible = true;
@@ -1506,13 +1890,14 @@
       clearOffset();
       removeLayerNode('middle');
       removeLayerNode('foreground');
-      targets = { hero: [], logo: [], middle: [], foreground: [] };
+      removeLayerNode('background2');
+      targets = { hero: [], logo: [], middle: [], foreground: [], background2: [] };
       state.heroBoxSize = null;
       state.heroPreviewSrc = null;
       state.logoPreviewSrc = null;
       state.logoRelBox = null;
       lastHeroKey = null;
-      state.layerImages = { middle: null, foreground: null, logo: null };
+      state.layerImages = { middle: null, foreground: null, logo: null, background2: null };
       state.notify();
 
       Backend.stopGyro(serverApi).then(function () {
@@ -1561,6 +1946,11 @@
         unmountOverlay();
         container.remove();
         unmountPreview();
+        // Deliberately NOT tearing down the welcome overlay here: showing it
+        // calls Navigation.CloseSideMenus() to get rid of the QAM "shade"
+        // that would otherwise cover it, which unmounts this very panel and
+        // runs this onDismount - the whole point is that the welcome screen
+        // survives that and stays on screen until the user dismisses it.
       },
     };
   }
