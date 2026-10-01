@@ -79,10 +79,11 @@ DEFAULT_PROFILE = {
         "foreground": 0.80,
         "logo": 1.00,
     },
-    "layerOpacity": {"middle": 1.0, "foreground": 1.0},
+    "layerOpacity": {"middle": 1.0, "foreground": 1.0, "background2": 1.0},
     "layerTransform": {
         "middle": {"x": 0, "y": 0, "scale": 1.0},
         "foreground": {"x": 0, "y": 0, "scale": 1.0},
+        "background2": {"x": 0, "y": 0, "scale": 1.0},
     },
     "logo": {
         "x": 0,
@@ -94,6 +95,12 @@ DEFAULT_PROFILE = {
     "calibration": {"x": 0.0, "y": 0.0},
     "mode": "simple",  # "simple" (one image, auto depth) or "advanced" (per-layer images)
     "images": {},  # layer -> "steam" | "custom" ; custom images stored separately
+    # When True, a second independent background image ("background2") is
+    # rendered between the real page background and the Middle layer, using
+    # its own image/opacity/size-position controls in the frontend, and
+    # takes over the "background" layerStrengths value instead of the real
+    # background getting parallax motion (see dist/index.js applyOffset()).
+    "customBackground": False,
 }
 
 PRESETS = {
@@ -335,6 +342,7 @@ class Plugin:
             self.settings.setSetting("profiles", profiles)
             self._remove_images(self._safe_key(appid), "middle")
             self._remove_images(self._safe_key(appid), "foreground")
+            self._remove_images(self._safe_key(appid), "background2")
         return {"ok": True}
 
     async def get_presets(self):
