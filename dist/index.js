@@ -252,6 +252,12 @@
   // gyro/useGyro
   // ---------------------------------------------------------------------
   var MIN_POLL_INTERVAL_MS = 1000 / 45;
+  // requestAnimationFrame simply stops firing while the device is asleep -
+  // the very next callback after waking reports however long real time
+  // actually passed. A gap this large can't be an ordinary frame hitch, so
+  // it's used as a (best-effort, no-API-required) signal that we probably
+  // just resumed from suspend. See onResumeSuspected/forceRecomposite().
+  var RESUME_GAP_MS = 1500;
 
   function startGyroLoop(options) {
     var filterState = createFilterState();
@@ -287,6 +293,19 @@
       var dt = now - lastFrameAt;
       lastFrameAt = now;
       if (dt > 0) fps = fps * 0.9 + (1000 / dt) * 0.1;
+
+      if (dt > RESUME_GAP_MS) {
+        // Likely just woke from suspend. Start the smoothing/auto-center
+        // fresh rather than easing in from whatever was last computed
+        // before sleeping (orientation may well have changed while off),
+        // and let the caller try to flush any stale GPU compositor state.
+        filterState.smoothedX = 0;
+        filterState.smoothedY = 0;
+        autoBase = null;
+        if (options.onResumeSuspected) {
+          try { options.onResumeSuspected(dt); } catch (e) {}
+        }
+      }
 
       if (now - lastPollAt >= MIN_POLL_INTERVAL_MS) {
         lastPollAt = now;
@@ -802,6 +821,11 @@
       calibRows.push(row(h(InfoField, { key: 'sz', label: 'Размеры (область / картинка)' }, state.debugSizes || '-')));
       calibRows.push(row(h(InfoField, { key: 'avail', label: 'Гироскоп' },
         debugSample && debugSample.available ? 'доступен' : ('недоступен' + (state.gyroReason ? ' (' + state.gyroReason + ')' : '')))));
+      calibRows.push(row(h(InfoField, { key: 'resume', label: 'Восстановлений после сна' },
+        state.debugResume
+          ? (state.debugResume.count + ' (пауза ' + Math.round(state.debugResume.gapMs) + ' мс, ' +
+             Math.max(0, Math.round((Date.now() - state.debugResume.at) / 1000)) + ' с назад)')
+          : 'не было')));
     }
 
     var scopeRow = row(h(InfoField, { key: 'scope', label: 'Профиль' },
@@ -1806,6 +1830,56 @@
       });
     }
 
+    function forceRecomposite(gapMs) {
+      // SteamOS/Chromium (the Steam UI itself runs on CEF) has a known
+      // class of bugs where the GPU compositor comes back from a suspend/
+      // resume cycle holding stale or corrupted textures for whatever was
+      // actively being transform-animated right when the device slept -
+      // this is exactly what we do to the hero/logo/custom layers every
+      // frame while enabled, and matches reports of flicker/"tripled"/
+      // ghosted imagery that visibly slides into place after waking. We
+      // can't fix the underlying browser/driver bug, but we are in the
+      // best position to nudge it: briefly clearing and forcing a layout
+      // flush before restoring each element's own transform is a standard
+      // way to make the browser drop a stale compositor layer and paint a
+      // fresh one from current content instead of reusing old GPU state.
+      function kick(el) {
+        if (!el || el.isConnected === false) return;
+        var savedTranslate = el.style.translate;
+        var savedScale = el.style.scale;
+        el.style.translate = '';
+        el.style.scale = '';
+        void el.offsetHeight; // synchronous layout flush
+        el.style.translate = savedTranslate;
+        el.style.scale = savedScale;
+      }
+      eachEl(targets.hero, kick);
+      eachEl(targets.logo, kick);
+      CUSTOM_LAYER_ORDER.forEach(function (layer) { eachEl(targets[layer], kick); });
+
+      // middle/foreground/background2 are clone nodes we fully own, so for
+      // those we can go further than a style nudge: drop them and let the
+      // next scan rebuild them from scratch, which guarantees no stale
+      // compositor texture can survive.
+      CUSTOM_LAYER_ORDER.forEach(function (layer) { removeLayerNode(layer); });
+      lastHeroKey = null;
+      scanTargets();
+
+      // The floating live-preview overlay animates the same way whenever
+      // it's open - rebuild it fresh too in case it was open at the
+      // moment of suspend.
+      if (previewDom) {
+        unmountPreview();
+        ensurePreviewMounted();
+      }
+
+      state.debugResume = {
+        count: (state.debugResume ? state.debugResume.count : 0) + 1,
+        gapMs: gapMs, at: Date.now(),
+      };
+      if (state.debugEnabled) state.notify();
+    }
+
     var stopLoop = startGyroLoop({
       serverAPI: serverApi,
       getEnabled: function () { return overlayVisible && !!(state.currentProfile && state.currentProfile.enabled); },
@@ -1823,6 +1897,7 @@
       clearOffset: clearOffset,
       getPreviewNudge: function () { return state.previewNudge; },
       onAvailability: function (available, reason) { state.gyroReason = available ? null : (reason || null); },
+      onResumeSuspected: forceRecomposite,
       onDebugSample: function (info) {
         state.lastRawSample = { x: info.rawX, y: info.rawY };
         if (state.debugEnabled) {
@@ -1835,6 +1910,34 @@
         }
       },
     });
+
+    // The rAF-gap check above is the primary, always-available resume
+    // signal, but it only fires on the next animation frame after waking -
+    // these two are cheap best-effort extras that can catch it sooner (or
+    // catch it at all if rAF happens to still be ticking through the sleep
+    // for some reason). Both are purely additive and no-op safely if
+    // unsupported: `visibilitychange` may not reflect a real Deck suspend
+    // on every SteamOS version, and SteamClient.System's suspend/resume
+    // hooks have reportedly been removed on some recent Steam client
+    // branches (decky-loader #803), so neither can be relied on alone.
+    var resumeDoc = getDoc();
+    function onVisibilityChange() {
+      if (resumeDoc && resumeDoc.hidden === false) forceRecomposite(0);
+    }
+    try {
+      if (resumeDoc && resumeDoc.addEventListener) {
+        resumeDoc.addEventListener('visibilitychange', onVisibilityChange);
+      }
+    } catch (e) {}
+
+    var unregisterSteamResume = null;
+    try {
+      var sys = window.SteamClient && window.SteamClient.System;
+      if (sys && typeof sys.RegisterForOnResumeFromSuspend === 'function') {
+        var reg = sys.RegisterForOnResumeFromSuspend(function () { forceRecomposite(0); });
+        if (reg && typeof reg.unregister === 'function') unregisterSteamResume = reg;
+      }
+    } catch (e) {}
 
     function loadLayerImage(appid, layer) {
       if (appid) {
@@ -1943,6 +2046,12 @@
         removeLayerNode('middle');
         removeLayerNode('foreground');
         Backend.stopGyro(serverApi);
+        try {
+          if (resumeDoc && resumeDoc.removeEventListener) {
+            resumeDoc.removeEventListener('visibilitychange', onVisibilityChange);
+          }
+        } catch (e) {}
+        try { if (unregisterSteamResume) unregisterSteamResume.unregister(); } catch (e) {}
         unmountOverlay();
         container.remove();
         unmountPreview();

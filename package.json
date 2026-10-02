@@ -1,6 +1,6 @@
 {
   "name": "gyro-parallax",
-  "version": "1.1.7",
+  "version": "1.0.2",
   "description": "Adds a smooth gyro-controlled 3D parallax effect to Steam Deck game pages.",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c rollup.config.mjs",

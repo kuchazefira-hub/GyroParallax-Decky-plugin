@@ -188,75 +188,102 @@ class GyroReader:
             self._task = None
 
     async def _run(self):
-        paths = _find_deck_hidraw_paths()
-        if not paths:
-            decky.logger.info("[GyroParallax] No Steam Deck hidraw device found")
-            self.last_sample = self._blank("no_device")
-            return
+        # Outer loop: (re)discover + (re)open the hidraw node(s), then read
+        # from them until they disappear, then retry. This used to be a
+        # single attempt - if the device node(s) ever vanished (which some
+        # firmware does briefly around a suspend/resume cycle, as opposed
+        # to just going quiet), the reader gave up for good and the user
+        # had to fully disable/re-enable the gyro to get it working again.
+        # Retrying here is cheap and makes the plugin self-heal instead.
+        last_logged_reason = None
+        while self._running:
+            paths = _find_deck_hidraw_paths()
+            if not paths:
+                self.last_sample = self._blank("no_device")
+                if last_logged_reason != "no_device":
+                    decky.logger.info("[GyroParallax] No Steam Deck hidraw device found")
+                    last_logged_reason = "no_device"
+                await asyncio.sleep(1.5)
+                continue
 
-        fds = {}
-        denied = False
-        for p in paths:
-            try:
-                fds[p] = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
-            except PermissionError:
-                denied = True
-            except OSError as e:
-                decky.logger.info(f"[GyroParallax] Could not open {p}: {e}")
-        if not fds:
-            self.last_sample = self._blank("permission_denied" if denied else "open_failed")
-            decky.logger.info(f"[GyroParallax] Gyro unavailable: {self.last_sample['reason']}")
-            return
-
-        decky.logger.info(f"[GyroParallax] Gyro initialized ({', '.join(fds)})")
-        reports = 0
-        started = time.time()
-        got_state = False
-        try:
-            while self._running:
-                progressed = False
-                for p, fd in list(fds.items()):
-                    while True:
-                        try:
-                            data = os.read(fd, 64)
-                        except BlockingIOError:
-                            break
-                        except OSError:
-                            fds.pop(p, None)
-                            try:
-                                os.close(fd)
-                            except OSError:
-                                pass
-                            break
-                        if not data:
-                            break
-                        progressed = True
-                        reports += 1
-                        parsed = _parse_deck_report(data)
-                        if parsed:
-                            got_state = True
-                            tx, ty, ax, ay, az = parsed
-                            self.available = True
-                            self.last_sample = {
-                                "available": True, "x": tx, "y": ty, "z": 0,
-                                "t": time.time(), "reason": None,
-                                "ax": ax, "ay": ay, "az": az,
-                            }
-                if not fds:
-                    self.last_sample = self._blank("device_lost")
-                    break
-                if not got_state and time.time() - started > 3.0:
-                    self.last_sample = self._blank(
-                        "no_state_reports", {"reports": reports}
-                    )
-                await asyncio.sleep(0.004 if progressed else 0.01)
-        finally:
-            for fd in fds.values():
+            fds = {}
+            denied = False
+            for p in paths:
                 try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            decky.logger.info("[GyroParallax] Gyro reader stopped")
+                    fds[p] = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+                except PermissionError:
+                    denied = True
+                except OSError as e:
+                    decky.logger.info(f"[GyroParallax] Could not open {p}: {e}")
+            if not fds:
+                reason = "permission_denied" if denied else "open_failed"
+                self.last_sample = self._blank(reason)
+                if last_logged_reason != reason:
+                    decky.logger.info(f"[GyroParallax] Gyro unavailable: {reason}")
+                    last_logged_reason = reason
+                await asyncio.sleep(1.5)
+                continue
+
+            last_logged_reason = None
+            decky.logger.info(f"[GyroParallax] Gyro initialized ({', '.join(fds)})")
+            reports = 0
+            started = time.time()
+            got_state = False
+            try:
+                while self._running:
+                    progressed = False
+                    for p, fd in list(fds.items()):
+                        while True:
+                            try:
+                                data = os.read(fd, 64)
+                            except BlockingIOError:
+                                break
+                            except OSError:
+                                # Stale/invalidated fd (e.g. the device was
+                                # transiently re-enumerated around a sleep
+                                # cycle) - drop it; if every fd ends up
+                                # dropped this way we fall through below and
+                                # retry discovery instead of ever reading
+                                # garbage from a bad fd.
+                                fds.pop(p, None)
+                                try:
+                                    os.close(fd)
+                                except OSError:
+                                    pass
+                                break
+                            if not data:
+                                break
+                            progressed = True
+                            reports += 1
+                            parsed = _parse_deck_report(data)
+                            if parsed:
+                                got_state = True
+                                tx, ty, ax, ay, az = parsed
+                                self.available = True
+                                self.last_sample = {
+                                    "available": True, "x": tx, "y": ty, "z": 0,
+                                    "t": time.time(), "reason": None,
+                                    "ax": ax, "ay": ay, "az": az,
+                                }
+                    if not fds:
+                        self.last_sample = self._blank("device_lost")
+                        decky.logger.info("[GyroParallax] Gyro device node(s) lost, retrying")
+                        break
+                    if not got_state and time.time() - started > 3.0:
+                        self.last_sample = self._blank(
+                            "no_state_reports", {"reports": reports}
+                        )
+                    await asyncio.sleep(0.004 if progressed else 0.01)
+            finally:
+                for fd in fds.values():
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            if not self._running:
+                break
+            await asyncio.sleep(1.5)  # brief backoff before retrying discovery
+        decky.logger.info("[GyroParallax] Gyro reader stopped")
 
 
 class Plugin:
