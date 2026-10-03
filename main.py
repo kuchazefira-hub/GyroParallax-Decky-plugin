@@ -66,18 +66,21 @@ ARTWORK_FILENAME_CANDIDATES = {
 
 DEFAULT_PROFILE = {
     "enabled": True,
+    # Default profile for a brand-new game page == the "Cinema" preset's own
+    # values (see PRESETS["cinematic"] below and PRESET_VALUES.cinematic in
+    # dist/index.js) - keep these three in sync.
     "preset": "cinematic",
-    "sensitivity": 35,
-    "maxDisplacement": 24,
-    "smoothing": 65,
-    "deadZone": 4,
-    "invertHorizontal": False,
+    "sensitivity": 60,
+    "maxDisplacement": 50,
+    "smoothing": 95,
+    "deadZone": 0,
+    "invertHorizontal": True,
     "invertVertical": False,
     "layerStrengths": {
-        "background": 0.25,
-        "middle": 0.50,
-        "foreground": 0.80,
-        "logo": 1.00,
+        "background": 1.20,
+        "middle": 0.70,
+        "foreground": 0.40,
+        "logo": 0.20,
     },
     "layerOpacity": {"middle": 1.0, "foreground": 1.0, "background2": 1.0},
     "layerTransform": {
@@ -103,10 +106,15 @@ DEFAULT_PROFILE = {
     "customBackground": False,
 }
 
+# NOTE: not currently called by the frontend (dist/index.js keeps its own,
+# authoritative copy as PRESET_VALUES, including per-layer strengths this
+# dict doesn't carry) - kept here only so get_presets()/this dict don't go
+# stale/misleading if something ever does call it. Names: subtle == "Light",
+# cinematic == "Cinema", strong == "Extreme" in the UI.
 PRESETS = {
-    "subtle": {"sensitivity": 18, "maxDisplacement": 10, "smoothing": 80, "deadZone": 6},
-    "cinematic": {"sensitivity": 35, "maxDisplacement": 24, "smoothing": 65, "deadZone": 4},
-    "strong": {"sensitivity": 60, "maxDisplacement": 42, "smoothing": 45, "deadZone": 2},
+    "subtle": {"sensitivity": 30, "maxDisplacement": 25, "smoothing": 80, "deadZone": 5},
+    "cinematic": {"sensitivity": 60, "maxDisplacement": 50, "smoothing": 95, "deadZone": 0},
+    "strong": {"sensitivity": 90, "maxDisplacement": 50, "smoothing": 87, "deadZone": 0},
 }
 
 

@@ -107,22 +107,40 @@
   // ---------------------------------------------------------------------
   // profiles/presets
   // ---------------------------------------------------------------------
+  // Each preset also forces a fixed set of "common" fields (invert H/V,
+  // custom background off) - see Задание 1: these three are meant to be
+  // identical across every preset, not independently tunable per-preset.
   var PRESET_VALUES = {
-    subtle: { sensitivity: 18, maxDisplacement: 10, smoothing: 80, deadZone: 6 },
-    cinematic: { sensitivity: 35, maxDisplacement: 24, smoothing: 65, deadZone: 4 },
-    strong: { sensitivity: 60, maxDisplacement: 42, smoothing: 45, deadZone: 2 },
+    subtle: {
+      sensitivity: 30, maxDisplacement: 25, smoothing: 80, deadZone: 5,
+      layerStrengths: { background: 0.40, middle: 0.60, foreground: 0.80, logo: 0.90 },
+      invertHorizontal: true, invertVertical: false, customBackground: false,
+    },
+    cinematic: {
+      sensitivity: 60, maxDisplacement: 50, smoothing: 95, deadZone: 0,
+      layerStrengths: { background: 1.20, middle: 0.70, foreground: 0.40, logo: 0.20 },
+      invertHorizontal: true, invertVertical: false, customBackground: false,
+    },
+    strong: {
+      sensitivity: 90, maxDisplacement: 50, smoothing: 87, deadZone: 0,
+      layerStrengths: { background: 0.70, middle: 0.90, foreground: 1.10, logo: 1.20 },
+      invertHorizontal: true, invertVertical: false, customBackground: false,
+    },
   };
 
   var DEFAULT_PROFILE = {
     enabled: true,
+    // Default profile for a brand-new game page == the "Cinema" preset's
+    // own values (see PRESET_VALUES.cinematic above) - keep these two in
+    // sync.
     preset: 'cinematic',
-    sensitivity: 35,
-    maxDisplacement: 24,
-    smoothing: 65,
-    deadZone: 4,
-    invertHorizontal: false,
+    sensitivity: 60,
+    maxDisplacement: 50,
+    smoothing: 95,
+    deadZone: 0,
+    invertHorizontal: true,
     invertVertical: false,
-    layerStrengths: { background: 0.25, middle: 0.5, foreground: 0.8, logo: 1.0 },
+    layerStrengths: { background: 1.20, middle: 0.70, foreground: 0.40, logo: 0.20 },
     layerOpacity: { middle: 1.0, foreground: 1.0, background2: 1.0 },
     layerTransform: { middle: { x: 0, y: 0, scale: 1 }, foreground: { x: 0, y: 0, scale: 1 }, background2: { x: 0, y: 0, scale: 1 } },
     logo: { x: 0, y: 0, scale: 1.0, opacity: 1.0, depth: 1.0 },
@@ -131,7 +149,8 @@
     images: {},
     // When on, a second, independent background image (`background2`) is
     // rendered between the real page background and the Middle layer, and
-    // takes over the "Фон: смещение" strength that would otherwise drive
+    // takes over the "Фон" strength (in the "Смещение" sub-group) that
+    // would otherwise drive
     // the real background - see applyOffset()/wantedLayerImage() for why
     // the real background stops moving while this is on (avoids animating
     // two full-screen layers with the same strength at once).
@@ -362,9 +381,9 @@
   // components/SettingsPanel
   // ---------------------------------------------------------------------
   var PRESET_OPTIONS = [
-    { data: 'subtle', label: 'Лёгкий' },
-    { data: 'cinematic', label: 'Кинематографичный' },
-    { data: 'strong', label: 'Сильный' },
+    { data: 'subtle', label: 'Light' },
+    { data: 'cinematic', label: 'Cinema' },
+    { data: 'strong', label: 'Extreme' },
     { data: 'custom', label: 'Свой' },
   ];
 
@@ -382,10 +401,6 @@
     var calibrating = calibratingState[0], setCalibrating = calibratingState[1];
     var calProgressState = useState(0);
     var calibrateProgress = calProgressState[0], setCalibrateProgress = calProgressState[1];
-    var debugState = useState(state.debugEnabled);
-    var debug = debugState[0], setDebug = debugState[1];
-    var debugSampleState = useState(state.lastDebugSample);
-    var debugSample = debugSampleState[0], setDebugSample = debugSampleState[1];
     var browseState = useState(null);
     var browse = browseState[0], setBrowse = browseState[1];
     var openGroupsState = useState({ settings: false, layers: false, calibration: false });
@@ -399,7 +414,6 @@
       return state.subscribe(function () {
         setAppid(state.currentAppId);
         setProfile(Object.assign(cloneDefaultProfile(), state.currentProfile || {}));
-        setDebugSample(state.lastDebugSample);
       });
     }, [state]);
 
@@ -586,10 +600,10 @@
     }
 
     var displacementRows = [
-      strengthRow('background', 'Фон: смещение'),
-      strengthRow('middle', 'Средний план: смещение'),
-      strengthRow('foreground', 'Передний план: смещение'),
-      strengthRow('logo', 'Логотип: смещение'),
+      strengthRow('background', 'Фон'),
+      strengthRow('middle', 'Средний план'),
+      strengthRow('foreground', 'Передний план'),
+      strengthRow('logo', 'Логотип'),
     ];
 
     var settingsRows = [
@@ -640,7 +654,7 @@
     }
     function strengthRow(layer, label) {
       return row(h(SliderField, {
-        key: 's:' + layer, label: label + ': смещение', value: Math.round(profile.layerStrengths[layer] * 100),
+        key: 's:' + layer, label: label, value: Math.round(profile.layerStrengths[layer] * 100),
         min: 0, max: 120, step: 1, showValue: true,
         onChange: function (v) {
           var st = Object.assign({}, profile.layerStrengths);
@@ -785,7 +799,7 @@
     if (customBgEnabled) {
       backgroundRows.push(row(h(InfoField, { key: 'bg2_info', label: 'Доп. фон' },
         'Слой поверх основного фона, но ниже остальных. Наследует смещение ' +
-        'основного фона (ползунок «Фон: смещение»); пока этот слой включён, ' +
+        'основного фона (ползунок «Фон» в «Смещение»); пока этот слой включён, ' +
         'сам основной фон параллакс-эффект не получает.')));
       backgroundRows.push.apply(backgroundRows, customLayerRows('background2'));
     }
@@ -810,31 +824,17 @@
         'Держите Steam Deck в обычном игровом положении и нажмите «Калибровать».')),
       row(h(ButtonItem, { key: 'reset', layout: 'below', onClick: resetCalibration }, 'Сбросить калибровку')),
     ];
-    if (debug) {
-      calibRows.push(row(h(InfoField, { key: 'gx', label: 'Наклон X (0.1°)' }, debugSample ? debugSample.rawX.toFixed(3) : '-')));
-      calibRows.push(row(h(InfoField, { key: 'gy', label: 'Наклон Y (0.1°)' }, debugSample ? debugSample.rawY.toFixed(3) : '-')));
-      calibRows.push(row(h(InfoField, { key: 'filt', label: 'После фильтра' },
-        debugSample ? (debugSample.filteredX.toFixed(2) + ', ' + debugSample.filteredY.toFixed(2)) : '-')));
-      calibRows.push(row(h(InfoField, { key: 'fps', label: 'FPS' }, debugSample ? String(debugSample.fps) : '-')));
-      calibRows.push(row(h(InfoField, { key: 'game', label: 'Текущая игра' }, appid || 'нет')));
-      calibRows.push(row(h(InfoField, { key: 'tg', label: 'Найденные слои' }, state.debugTargets || '-')));
-      calibRows.push(row(h(InfoField, { key: 'sz', label: 'Размеры (область / картинка)' }, state.debugSizes || '-')));
-      calibRows.push(row(h(InfoField, { key: 'avail', label: 'Гироскоп' },
-        debugSample && debugSample.available ? 'доступен' : ('недоступен' + (state.gyroReason ? ' (' + state.gyroReason + ')' : '')))));
-      calibRows.push(row(h(InfoField, { key: 'resume', label: 'Восстановлений после сна' },
-        state.debugResume
-          ? (state.debugResume.count + ' (пауза ' + Math.round(state.debugResume.gapMs) + ' мс, ' +
-             Math.max(0, Math.round((Date.now() - state.debugResume.at) / 1000)) + ' с назад)')
-          : 'не было')));
-    }
 
     var scopeRow = row(h(InfoField, { key: 'scope', label: 'Профиль' },
       isGameScoped ? ('эта игра (' + appid + ')') : 'глобальный'));
 
-    var debugToggleRow = row(h(ToggleField, {
-      key: 'dbg', label: 'Отладочная информация', checked: debug,
-      onChange: function (v) { setDebug(v); state.debugEnabled = v; state.notify(); },
-    }));
+    // The actual debug readouts (sensor/FPS/targets/etc.) now live on their
+    // own full-screen page (see showDebugPage() in pluginFactory) instead of
+    // inline here - this just opens it.
+    var debugButtonRow = row(h(ButtonItem, {
+      key: 'dbgpage', layout: 'below',
+      onClick: function () { if (state.openDebugPage) state.openDebugPage(); },
+    }, 'Отладочная информация'));
 
     var banner = h('img', {
       key: 'banner', src: BANNER_DATA_URI, alt: 'GyroParallax',
@@ -859,7 +859,7 @@
         .concat(group('settings', 'Настройка', settingsRows))
         .concat(group('layers', 'Слои', layersRows))
         .concat(group('calibration', 'Калибровка гироскопа', calibRows))
-        .concat([debugToggleRow]);
+        .concat([debugButtonRow]);
     }
 
     return h(PanelSection, null, allRows);
@@ -1108,7 +1108,7 @@
     'меняется без открытой игры, становится общим значением по умолчанию для всех ' +
     'остальных игр.</li>' +
     '<li style="margin-bottom:10px;"><b>Готовые пресеты и тонкая настройка.</b> Быстрый ' +
-    'выбор между «Лёгким», «Кинематографичным» и «Сильным» эффектом или ручная настройка ' +
+    'выбор между «Light», «Cinema» и «Extreme» эффектом или ручная настройка ' +
     'чувствительности, сглаживания, мёртвой зоны и инверсии осей.</li>' +
     '<li style="margin-bottom:10px;"><b>Живое превью.</b> Прямо в панели настроек можно ' +
     'увидеть, как будут выглядеть выбранные изображения и их положение — без ' +
@@ -1201,6 +1201,143 @@
   }
 
   // ---------------------------------------------------------------------
+  // Debug info page - a plain full-screen overlay (same approach/reasons as
+  // the welcome screen above: has to sit above the Quick Access Menu shade,
+  // and needs real DOM focus + a manual gamepad/keydown poll since it isn't
+  // part of Steam's own Focusable tree). Opened from a button under
+  // "Калибровка гироскопа" in SettingsPanel; shows the same readouts that
+  // used to live inline in that group, but live-updates via state.subscribe
+  // instead of React so it works the same whether Steam's own React tree
+  // for this panel is even mounted at the time.
+  // ---------------------------------------------------------------------
+  var DEBUG_FIELD_DEFS = [
+    { key: 'gx', label: 'Наклон X (0.1°)' },
+    { key: 'gy', label: 'Наклон Y (0.1°)' },
+    { key: 'filt', label: 'После фильтра' },
+    { key: 'fps', label: 'FPS' },
+    { key: 'game', label: 'Текущая игра' },
+    { key: 'tg', label: 'Найденные слои' },
+    { key: 'sz', label: 'Размеры (область / картинка)' },
+    { key: 'avail', label: 'Гироскоп' },
+    { key: 'resume', label: 'Восстановлений после сна' },
+  ];
+
+  function buildDebugDom(doc, onBack) {
+    var root = doc.createElement('div');
+    root.id = 'gyroparallax-debug-root';
+    root.setAttribute('data-gp-preview', 'true'); // excluded from hero/logo scanning, same as welcome/preview
+    root.setAttribute('tabindex', '-1');
+    root.style.position = 'fixed';
+    root.style.inset = '0';
+    root.style.zIndex = '2147483647';
+    root.style.background = 'rgba(10, 11, 14, 0.94)';
+    root.style.display = 'flex';
+    root.style.flexDirection = 'column';
+    root.style.alignItems = 'center';
+    root.style.overflowY = 'auto';
+    root.style.padding = '4vh 16px';
+    root.style.boxSizing = 'border-box';
+    root.style.pointerEvents = 'auto';
+    root.style.color = '#f1f1f4';
+    root.style.fontFamily = 'inherit';
+    root.style.outline = 'none';
+
+    var card = doc.createElement('div');
+    card.style.width = '100%';
+    card.style.maxWidth = '640px';
+    card.style.margin = 'auto';
+    card.style.background = '#1a1c23';
+    card.style.border = '1px solid rgba(255,255,255,0.12)';
+    card.style.borderRadius = '14px';
+    card.style.boxShadow = '0 8px 32px rgba(0,0,0,0.6)';
+    card.style.padding = '22px 24px 26px';
+    card.style.boxSizing = 'border-box';
+    root.appendChild(card);
+
+    var title = doc.createElement('h2');
+    title.textContent = 'Отладочная информация';
+    title.style.margin = '0 0 16px';
+    title.style.fontSize = '1.25em';
+    card.appendChild(title);
+
+    var list = doc.createElement('div');
+    list.style.display = 'flex';
+    list.style.flexDirection = 'column';
+    list.style.gap = '8px';
+    card.appendChild(list);
+
+    var fields = {};
+    DEBUG_FIELD_DEFS.forEach(function (def) {
+      var rowEl = doc.createElement('div');
+      rowEl.style.display = 'flex';
+      rowEl.style.justifyContent = 'space-between';
+      rowEl.style.alignItems = 'baseline';
+      rowEl.style.gap = '14px';
+      rowEl.style.padding = '9px 12px';
+      rowEl.style.background = 'rgba(255,255,255,0.05)';
+      rowEl.style.borderRadius = '8px';
+      rowEl.style.fontSize = '14px';
+
+      var labelEl = doc.createElement('span');
+      labelEl.textContent = def.label;
+      labelEl.style.opacity = '0.75';
+      labelEl.style.flexShrink = '0';
+      rowEl.appendChild(labelEl);
+
+      var valueEl = doc.createElement('span');
+      valueEl.textContent = '-';
+      valueEl.style.fontWeight = '600';
+      valueEl.style.textAlign = 'right';
+      valueEl.style.wordBreak = 'break-word';
+      rowEl.appendChild(valueEl);
+
+      list.appendChild(rowEl);
+      fields[def.key] = valueEl;
+    });
+
+    var btnWrap = doc.createElement('div');
+    btnWrap.style.display = 'flex';
+    btnWrap.style.justifyContent = 'center';
+    btnWrap.style.marginTop = '22px';
+    card.appendChild(btnWrap);
+
+    var btn = doc.createElement('button');
+    btn.textContent = 'Назад';
+    btn.style.font = 'inherit';
+    btn.style.fontWeight = '700';
+    btn.style.fontSize = '16px';
+    btn.style.padding = '10px 38px';
+    btn.style.borderRadius = '999px';
+    btn.style.border = 'none';
+    btn.style.cursor = 'pointer';
+    btn.style.color = '#101317';
+    btn.style.background = 'linear-gradient(135deg, #7fe0c8, #5bb8e0)';
+    btn.style.boxShadow = '0 4px 14px rgba(91, 184, 224, 0.4)';
+    btn.onclick = function () { if (onBack) onBack(); };
+    btnWrap.appendChild(btn);
+
+    return { root: root, fields: fields };
+  }
+
+  function renderDebugDom(dom, state) {
+    if (!dom || !dom.fields) return;
+    var s = state.lastDebugSample;
+    function set(key, text) { if (dom.fields[key]) dom.fields[key].textContent = text; }
+    set('gx', s ? s.rawX.toFixed(3) : '-');
+    set('gy', s ? s.rawY.toFixed(3) : '-');
+    set('filt', s ? (s.filteredX.toFixed(2) + ', ' + s.filteredY.toFixed(2)) : '-');
+    set('fps', s ? String(s.fps) : '-');
+    set('game', state.currentAppId || 'нет');
+    set('tg', state.debugTargets || '-');
+    set('sz', state.debugSizes || '-');
+    set('avail', s && s.available ? 'доступен' : ('недоступен' + (state.gyroReason ? ' (' + state.gyroReason + ')' : '')));
+    set('resume', state.debugResume
+      ? (state.debugResume.count + ' (пауза ' + Math.round(state.debugResume.gapMs) + ' мс, ' +
+         Math.max(0, Math.round((Date.now() - state.debugResume.at) / 1000)) + ' с назад)')
+      : 'не было');
+  }
+
+  // ---------------------------------------------------------------------
   // index.tsx - plugin entry point
   // ---------------------------------------------------------------------
   var GAME_PAGE_RE = /(?:library\/app|appdetails|steamgame|game)\/(\d+)/i;
@@ -1277,6 +1414,7 @@
 
     state.subscribe(function () {
       if (previewDom && previewDom.root.isConnected) renderPreviewDom(previewDom, state);
+      if (debugDom && debugDom.root.isConnected) renderDebugDom(debugDom, state);
     });
     ensurePreviewMounted();
 
@@ -1310,6 +1448,15 @@
     var welcomeGamepadTimerWin = null;
     var welcomeGamepadPrevConfirm = false;
     var welcomeKeydownDoc = null;
+
+    // Debug info page - same full-screen-overlay mechanics as the welcome
+    // screen above (see its own comment block), dismissed with "Назад"/B/
+    // Escape instead of a "confirm" action since it's just a read-only view.
+    var debugDom = null;
+    var debugGamepadTimer = null;
+    var debugGamepadTimerWin = null;
+    var debugGamepadPrevBack = false;
+    var debugKeydownDoc = null;
 
     function getWin() {
       try {
@@ -1449,6 +1596,123 @@
       scheduleTimeout(focusWelcomeRoot, 60);
       scheduleTimeout(focusWelcomeRoot, 350);
     }
+
+    function focusDebugRoot() {
+      if (!debugDom || !debugDom.root) return;
+      try {
+        if (debugDom.root.tabIndex == null || debugDom.root.tabIndex < 0) debugDom.root.tabIndex = -1;
+        if (debugDom.root.ownerDocument && debugDom.root.ownerDocument.activeElement !== debugDom.root) {
+          debugDom.root.focus({ preventScroll: true });
+        }
+      } catch (e) {}
+    }
+
+    function onDebugKeydown(e) {
+      if (!debugDom || !debugDom.root) return;
+      if (e.key === 'Escape' || e.key === 'Backspace' || e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        dismissDebugPage();
+      } else if (e.key === 'ArrowDown') {
+        debugDom.root.scrollTop += 60;
+      } else if (e.key === 'ArrowUp') {
+        debugDom.root.scrollTop -= 60;
+      } else if (e.key === 'PageDown') {
+        debugDom.root.scrollTop += 300;
+      } else if (e.key === 'PageUp') {
+        debugDom.root.scrollTop -= 300;
+      }
+    }
+
+    function stopDebugGamepadLoop() {
+      if (debugGamepadTimer) {
+        try { ((debugGamepadTimerWin && debugGamepadTimerWin.clearInterval) ? debugGamepadTimerWin : window).clearInterval(debugGamepadTimer); } catch (e) {}
+      }
+      debugGamepadTimer = null;
+      debugGamepadTimerWin = null;
+    }
+    function startDebugGamepadLoop() {
+      if (debugGamepadTimer) return;
+      debugGamepadPrevBack = false;
+      var win = getWin();
+      debugGamepadTimerWin = win;
+      var scheduleInterval = (win && typeof win.setInterval === 'function') ? win.setInterval.bind(win) : setInterval;
+      debugGamepadTimer = scheduleInterval(function () {
+        if (!debugDom || !debugDom.root || !debugDom.root.isConnected) { stopDebugGamepadLoop(); return; }
+        focusDebugRoot();
+        try {
+          var padLists = [];
+          if (win && win.navigator && win.navigator.getGamepads) padLists.push(win.navigator.getGamepads());
+          if (typeof navigator !== 'undefined' && navigator.getGamepads &&
+              (!win || navigator !== win.navigator)) padLists.push(navigator.getGamepads());
+          var backPressed = false;
+          for (var li = 0; li < padLists.length; li++) {
+            var pads = padLists[li];
+            if (!pads) continue;
+            for (var i = 0; i < pads.length; i++) {
+              var gp = pads[i];
+              if (!gp) continue;
+              var axisY = (gp.axes && gp.axes.length > 1) ? gp.axes[1] : 0;
+              if (Math.abs(axisY) > 0.2) debugDom.root.scrollTop += axisY * 18;
+              if (gp.buttons[12] && gp.buttons[12].pressed) debugDom.root.scrollTop -= 12;
+              if (gp.buttons[13] && gp.buttons[13].pressed) debugDom.root.scrollTop += 12;
+              // Button 1 is "B" on the standard gamepad mapping - Steam's
+              // own convention for "Назад"/back, which fits a read-only page
+              // better than the welcome screen's "confirm" (A) semantics.
+              if (gp.buttons[1] && gp.buttons[1].pressed) backPressed = true;
+            }
+          }
+          if (backPressed && !debugGamepadPrevBack) dismissDebugPage();
+          debugGamepadPrevBack = backPressed;
+        } catch (e) {}
+      }, 33);
+    }
+
+    function dismissDebugPage() {
+      if (debugDom && debugDom.root && debugDom.root.parentNode) {
+        debugDom.root.parentNode.removeChild(debugDom.root);
+      }
+      debugDom = null;
+      stopDebugGamepadLoop();
+      if (debugKeydownDoc) {
+        try { debugKeydownDoc.removeEventListener('keydown', onDebugKeydown, true); } catch (e) {}
+        debugKeydownDoc = null;
+      }
+      // Stop paying for the (slightly) more detailed per-frame debug sample
+      // bookkeeping once nothing is actually displaying it - see
+      // onDebugSample in startGyroLoop()'s options below.
+      state.debugEnabled = false;
+    }
+    function showDebugPage() {
+      var doc = getDoc();
+      if (!doc || !doc.body) return;
+      if (!(debugDom && debugDom.root && debugDom.root.isConnected)) {
+        // No live in-memory dom (or it's gone stale/detached) - clear out
+        // any leftover node by id (shouldn't normally exist, but would have
+        // no field refs attached if it did) and build a fresh one so
+        // dom.fields is always guaranteed valid.
+        var existing = doc.getElementById && doc.getElementById('gyroparallax-debug-root');
+        if (existing && existing.parentNode) { try { existing.parentNode.removeChild(existing); } catch (e) {} }
+        debugDom = buildDebugDom(doc, dismissDebugPage);
+        doc.body.appendChild(debugDom.root);
+      }
+      state.debugEnabled = true;
+      renderDebugDom(debugDom, state);
+      startDebugGamepadLoop();
+      try {
+        doc.addEventListener('keydown', onDebugKeydown, true);
+        debugKeydownDoc = doc;
+      } catch (e) {}
+      focusDebugRoot();
+      closeSideMenusIfPossible();
+      var win = getWin();
+      var scheduleTimeout = (win && typeof win.setTimeout === 'function') ? win.setTimeout.bind(win) : setTimeout;
+      scheduleTimeout(focusDebugRoot, 60);
+      scheduleTimeout(focusDebugRoot, 350);
+    }
+    // Only ever opened manually, by clicking the "Отладочная информация"
+    // button under "Калибровка гироскопа" in SettingsPanel - no auto-show.
+    state.openDebugPage = showDebugPage;
+
     // Only ever opened manually, by clicking the plugin's own banner in its
     // Quick Access Menu panel (see the banner's onClick in SettingsPanel) -
     // deliberately no auto-show on install/startup/version change.
@@ -2055,11 +2319,12 @@
         unmountOverlay();
         container.remove();
         unmountPreview();
-        // Deliberately NOT tearing down the welcome overlay here: showing it
-        // calls Navigation.CloseSideMenus() to get rid of the QAM "shade"
-        // that would otherwise cover it, which unmounts this very panel and
-        // runs this onDismount - the whole point is that the welcome screen
-        // survives that and stays on screen until the user dismisses it.
+        // Deliberately NOT tearing down the welcome overlay or the debug
+        // info page here: showing either calls Navigation.CloseSideMenus()
+        // to get rid of the QAM "shade" that would otherwise cover them,
+        // which unmounts this very panel and runs this onDismount - the
+        // whole point is that both survive that and stay on screen until
+        // the user dismisses them.
       },
     };
   }
