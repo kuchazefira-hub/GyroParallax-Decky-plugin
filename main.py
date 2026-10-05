@@ -299,11 +299,23 @@ class Plugin:
 
     # -- lifecycle ----------------------------------------------------
 
+    @staticmethod
+    def _settings_dir() -> str:
+        """The one and only directory this plugin ever persists anything
+        under: settings.json (global settings + every per-game profile +
+        calibration) AND the custom-images folder both live here, and
+        nowhere else. Normally Decky Loader sets DECKY_PLUGIN_SETTINGS_DIR
+        to .../homebrew/settings/GyroParallax; the ~/.config fallback only
+        matters if that's ever unset (e.g. running outside a real Decky
+        environment). This used to be computed independently in two
+        separate places, which could in principle drift apart - it's now
+        a single method both call, so there is exactly one answer."""
+        return getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", None) or os.path.expanduser("~/.config/GyroParallax")
+
     async def _main(self):
         decky.logger.info("[GyroParallax] Plugin initialized")
-        settings_dir = getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", None) or os.path.expanduser("~/.config/GyroParallax")
         self.settings = SettingsManager(
-            name="settings", settings_directory=settings_dir
+            name="settings", settings_directory=self._settings_dir()
         )
         self.settings.read()
         os.makedirs(self._custom_image_dir(), exist_ok=True)
@@ -333,8 +345,7 @@ class Plugin:
 
     @staticmethod
     def _custom_image_dir():
-        settings_dir = getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", None) or os.path.expanduser("~/.config/GyroParallax")
-        d = os.path.join(settings_dir, "images")
+        d = os.path.join(Plugin._settings_dir(), "images")
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -384,30 +395,62 @@ class Plugin:
         return PRESETS
 
     async def set_calibration(self, appid: str, x: float, y: float):
-        if not appid or appid == "global":
-            target = dict(self.settings.getSetting("global", DEFAULT_PROFILE))
-            target["calibration"] = {"x": x, "y": y}
-            self.settings.setSetting("global", target)
-        else:
-            profiles = dict(self.settings.getSetting("profiles", {}))
-            target = dict(profiles.get(appid) or self.settings.getSetting("global", DEFAULT_PROFILE))
-            target["calibration"] = {"x": x, "y": y}
-            profiles[appid] = target
-            self.settings.setSetting("profiles", profiles)
+        # Calibration captures how the Deck is physically being held, not
+        # anything about the specific game - it used to be saved into
+        # whichever profile (a specific game's, or the global default) was
+        # active at the time, so calibrating once on Game A didn't carry
+        # over to Game B and vice versa. It's now always a single,
+        # plugin-wide value; `appid` is still accepted (older frontend
+        # builds pass it) but no longer affects where this is stored.
+        self.settings.setSetting("calibration", {"x": x, "y": y})
         return {"ok": True}
 
     async def reset_calibration(self, appid: str):
-        if not appid or appid == "global":
-            target = dict(self.settings.getSetting("global", DEFAULT_PROFILE))
-            target["calibration"] = {"x": 0.0, "y": 0.0}
-            self.settings.setSetting("global", target)
-        else:
-            profiles = dict(self.settings.getSetting("profiles", {}))
-            target = dict(profiles.get(appid) or self.settings.getSetting("global", DEFAULT_PROFILE))
-            target["calibration"] = {"x": 0.0, "y": 0.0}
-            profiles[appid] = target
-            self.settings.setSetting("profiles", profiles)
+        self.settings.setSetting("calibration", {"x": 0.0, "y": 0.0})
         return {"ok": True}
+
+    async def get_calibration(self):
+        return dict(self.settings.getSetting("calibration", {"x": 0.0, "y": 0.0}))
+
+    # Diagnostic knob (see v1.0.23-26 README notes): how long enterGame()
+    # waits, doing nothing at all, right after a game page is detected,
+    # before it starts scanning the DOM/fetching the profile/enabling the
+    # overlay - gives Steam's own page-entrance animation/loading a clear
+    # run before this plugin starts reading layout/measuring elements
+    # itself. Plugin-wide, like calibration, not per-game - exposed as a
+    # slider on the "Отладочная информация" page so it can be tuned
+    # in-place while testing instead of needing a new build each time.
+    DEFAULT_ENTER_DELAY_MS = 600
+
+    async def get_enter_delay(self):
+        return {"ms": self.settings.getSetting("enterDelayMs", self.DEFAULT_ENTER_DELAY_MS)}
+
+    async def set_enter_delay(self, ms: int):
+        ms = max(0, min(2000, int(ms)))
+        self.settings.setSetting("enterDelayMs", ms)
+        return {"ok": True, "ms": ms}
+
+    # Highly experimental, opt-in-only alternate rendering mode (see
+    # v1.0.30 README notes): instead of ever writing a translate/scale
+    # directly onto Steam's own hero/logo elements (which could still be
+    # mid-transition/under Steam's own control when we touch them), clone
+    # them once the page settles and animate the clone only, hiding the
+    # original - so nothing this plugin does can ever conflict with
+    # whatever Steam itself is doing to that same original element.
+    # Off (False) by default so the already-confirmed-working direct
+    # approach stays the default for everyone; only users who explicitly
+    # flip this on (debug page) are exposed to its own, different set of
+    # risks (see README). Plugin-wide, like calibration/enterDelayMs, not
+    # per-game.
+    DEFAULT_USE_NATIVE_CLONE = False
+
+    async def get_use_native_clone(self):
+        return {"on": bool(self.settings.getSetting("useNativeClone", self.DEFAULT_USE_NATIVE_CLONE))}
+
+    async def set_use_native_clone(self, on: bool):
+        on = bool(on)
+        self.settings.setSetting("useNativeClone", on)
+        return {"ok": True, "on": on}
 
     # -- artwork ---------------------------------------------------------
 
@@ -482,18 +525,16 @@ class Plugin:
 
     @staticmethod
     def _remove_images(appid: str, layer: str):
-        dirs = [Plugin._custom_image_dir()]
-        runtime_dir = getattr(decky, "DECKY_PLUGIN_RUNTIME_DIR", None)
-        if runtime_dir:
-            dirs.append(os.path.join(runtime_dir, "images"))
-        for d in dirs:
-            for ext in ("png", "jpg", "jpeg", "webp"):
-                p = os.path.join(d, f"{appid}_{layer}.{ext}")
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+        # Only ever _custom_image_dir() (under _settings_dir()) - there is
+        # no second location custom images can live in.
+        d = Plugin._custom_image_dir()
+        for ext in ("png", "jpg", "jpeg", "webp"):
+            p = os.path.join(d, f"{appid}_{layer}.{ext}")
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     async def remove_custom_image(self, appid: str, layer: str):
         try:
@@ -540,15 +581,11 @@ class Plugin:
     async def get_custom_image(self, appid: str, layer: str):
         try:
             appid, layer = self._safe_key(appid), self._safe_key(layer)
-            dirs = [self._custom_image_dir()]
-            runtime_dir = getattr(decky, "DECKY_PLUGIN_RUNTIME_DIR", None)
-            if runtime_dir:
-                dirs.append(os.path.join(runtime_dir, "images"))
-            for d in dirs:
-                for ext in ("png", "jpg", "jpeg", "webp"):
-                    path = os.path.join(d, f"{appid}_{layer}.{ext}")
-                    if os.path.exists(path):
-                        return self._file_to_data_uri(path)
+            d = self._custom_image_dir()
+            for ext in ("png", "jpg", "jpeg", "webp"):
+                path = os.path.join(d, f"{appid}_{layer}.{ext}")
+                if os.path.exists(path):
+                    return self._file_to_data_uri(path)
             return None
         except Exception as e:
             decky.logger.error(f"[GyroParallax] get_custom_image failed: {e}", exc_info=True)

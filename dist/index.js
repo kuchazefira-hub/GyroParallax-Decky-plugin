@@ -144,7 +144,20 @@
     layerOpacity: { middle: 1.0, foreground: 1.0, background2: 1.0 },
     layerTransform: { middle: { x: 0, y: 0, scale: 1 }, foreground: { x: 0, y: 0, scale: 1 }, background2: { x: 0, y: 0, scale: 1 } },
     logo: { x: 0, y: 0, scale: 1.0, opacity: 1.0, depth: 1.0 },
+    // Deprecated/unused as of the plugin-wide calibration change - see
+    // state.globalCalibration and Backend.getCalibration()/setCalibration().
+    // Kept only so Object.assign() doesn't choke on old saved profiles that
+    // still carry their own (now ignored) per-game calibration value.
     calibration: { x: 0, y: 0 },
+    // How long the startup ramp (see applyOffset()/startupRamp()) takes to
+    // go from 0 up to this profile's real values each time a game page is
+    // opened, in ms. UI only offers four stops - 500/1000/1500/2000 - see
+    // the "Плавное появление эффекта" slider under "Экспериментальные
+    // настройки" on the "Отладочная информация" page (moved there from
+    // the "Настройки" tab in v1.0.28). Lowered to 500 in v1.0.32, matching
+    // what real-device testing (together with 600ms enter-delay and
+    // native-clone mode) confirmed runs smoothly on every game page.
+    rampDurationMs: 500,
     mode: 'simple',
     images: {},
     // When on, a second, independent background image (`background2`) is
@@ -155,6 +168,14 @@
     // the real background stops moving while this is on (avoids animating
     // two full-screen layers with the same strength at once).
     customBackground: false,
+    // When on (Слои > Фон > "Блюр вместо фона"), the real/sharp hero image
+    // is hidden and the blurred letterboxing copy Steam renders behind it
+    // (on pages that have one) is shown and animated instead - independent
+    // of customBackground/background2 above, which can still be turned on
+    // at the same time (it simply layers on top of whichever of the two
+    // ends up visible). See scanTargetsUnsafe()'s heroBlurred/heroSharp
+    // split for the implementation.
+    useBlurredBackground: false,
   };
 
   function cloneDefaultProfile() {
@@ -225,6 +246,11 @@
     deleteProfile: function (api, appid) { return rpc(api, 'delete_profile', { appid: appid }); },
     setCalibration: function (api, appid, x, y) { return rpc(api, 'set_calibration', { appid: appid, x: x, y: y }); },
     resetCalibration: function (api, appid) { return rpc(api, 'reset_calibration', { appid: appid }); },
+    getCalibration: function (api) { return rpc(api, 'get_calibration'); },
+    getEnterDelay: function (api) { return rpc(api, 'get_enter_delay'); },
+    setEnterDelay: function (api, ms) { return rpc(api, 'set_enter_delay', { ms: ms }); },
+    getUseNativeClone: function (api) { return rpc(api, 'get_use_native_clone'); },
+    setUseNativeClone: function (api, on) { return rpc(api, 'set_use_native_clone', { on: on }); },
     getArtwork: function (api, appid) { return rpc(api, 'get_artwork', { appid: appid }); },
     importCustomImage: function (api, appid, layer, path) {
       return rpc(api, 'import_custom_image', { appid: appid, layer: layer, path: path });
@@ -242,6 +268,29 @@
   function PluginState() {
     this.currentAppId = null;
     this.currentProfile = null;
+    // Calibration (how the Deck is physically being held) is plugin-wide,
+    // not per-game - kept separate from currentProfile on purpose so it
+    // can never end up tied to whichever game happens to be open. Loaded
+    // once at startup (see Backend.getCalibration()) and updated whenever
+    // the user (re)calibrates or resets it.
+    this.globalCalibration = { x: 0, y: 0 };
+    // Diagnostic knob, plugin-wide like calibration - see
+    // Backend.getEnterDelay()/setEnterDelay() and enterGame(). Default
+    // mirrors the backend's own default so the slider starts somewhere
+    // sane even before the real saved value has loaded.
+    this.enterDelayMs = 600;
+    // Highly experimental, opt-in-only (see waitForPageSettle()/
+    // syncLayerNodes()-adjacent native-clone code near enterGame(), and
+    // the v1.0.30 README notes). Off by default - mirrors the backend's
+    // own default so the toggle starts unchecked even before the real
+    // saved value has loaded.
+    this.useNativeClone = false;
+    // Debug-only readouts for the experiments above - see
+    // waitForPageSettle()/nativeCloneFor() and the "Экспериментальные
+    // настройки" block on the debug page. Populated once a game page has
+    // actually been entered/scanned at least once; null beforehand.
+    this.debugSettle = null;
+    this.debugNativeClone = null;
     this.debugEnabled = false;
     this.lastDebugSample = null;
     this.lastRawSample = null;
@@ -288,6 +337,18 @@
     var fps = 0;
     var lastSample = { available: false, x: 0, y: 0 };
     var autoBase = null;
+    // filterState/autoBase both live here, for the whole life of the
+    // plugin - they are NOT recreated per enterGame() (that function has
+    // no access to this closure). Left alone, smoothedX/Y simply carry
+    // whatever value they had when the *previous* game page was left -
+    // if the Deck was being tilted at that moment, the new page starts
+    // with that stale residual and then visibly glides/jerks back toward
+    // zero over the next second or so as the exponential filter catches
+    // up, on top of an otherwise-already-settled scene. Since this only
+    // shows up when the old residual happened to be non-zero at hand-off,
+    // it explained why the leftover jerk was intermittent - present on
+    // some page opens, absent on others - rather than every time.
+    var lastSeenAppId = null;
 
     function poll() {
       if (inFlight || stopped) return Promise.resolve(null);
@@ -312,6 +373,19 @@
       var dt = now - lastFrameAt;
       lastFrameAt = now;
       if (dt > 0) fps = fps * 0.9 + (1000 / dt) * 0.1;
+
+      var curAppId = options.getCurrentAppId ? options.getCurrentAppId() : null;
+      if (curAppId !== lastSeenAppId) {
+        // Fresh game page (including "left a game, now on none") - start
+        // the smoothing filter and auto-centered baseline from scratch so
+        // this page's own first frame isn't biased by whatever the last
+        // page's tilt happened to leave behind. See the note on
+        // lastSeenAppId's declaration above for the bug this fixes.
+        lastSeenAppId = curAppId;
+        filterState.smoothedX = 0;
+        filterState.smoothedY = 0;
+        autoBase = null;
+      }
 
       if (dt > RESUME_GAP_MS) {
         // Likely just woke from suspend. Start the smoothing/auto-center
@@ -460,10 +534,14 @@
       persist(next);
     }
 
+    // Calibration is plugin-wide (see state.globalCalibration) - it's no
+    // longer written into whichever profile happens to be active, so
+    // calibrating while on one game's page now applies everywhere,
+    // including every other game and the global defaults, instead of only
+    // that one game.
     function calibrate() {
       setCalibrating(true);
       setCalibrateProgress(0);
-      var targetId = state.currentAppId || 'global';
       var duration = 1400;
       var startedAt = performance.now();
       var timer = setInterval(function () {
@@ -472,9 +550,9 @@
         if (elapsed >= duration) {
           clearInterval(timer);
           var sample = state.lastRawSample || { x: 0, y: 0 };
-          Backend.setCalibration(serverAPI, targetId, sample.x, sample.y).then(function () {
-            var next = Object.assign({}, profile, { calibration: { x: sample.x, y: sample.y } });
-            persist(next);
+          Backend.setCalibration(serverAPI, 'global', sample.x, sample.y).then(function () {
+            state.globalCalibration = { x: sample.x, y: sample.y };
+            state.notify();
             setCalibrating(false);
           });
         }
@@ -482,9 +560,9 @@
     }
 
     function resetCalibration() {
-      var targetId = state.currentAppId || 'global';
-      Backend.resetCalibration(serverAPI, targetId).then(function () {
-        persist(Object.assign({}, profile, { calibration: { x: 0, y: 0 } }));
+      Backend.resetCalibration(serverAPI, 'global').then(function () {
+        state.globalCalibration = { x: 0, y: 0 };
+        state.notify();
       });
     }
 
@@ -611,6 +689,13 @@
         key: 'enable', label: 'Включить параллакс', checked: profile.enabled,
         onChange: function (v) { update('enabled', v); },
       })),
+      // "Плавное появление эффекта" moved to the "Экспериментальные
+      // настройки" group on the "Отладочная информация" page (v1.0.28) -
+      // it's a diagnostic knob for chasing the load-delay/"pop" glitch,
+      // grouped there next to "Задержка перед включением эффекта" rather
+      // than living here among normal user preferences. Still the same
+      // profile.rampDurationMs field/save rules, just a different slider
+      // location.
       row(h(DropdownField, {
         key: 'preset', label: 'Пресет', rgOptions: PRESET_OPTIONS, selectedOption: profile.preset,
         onChange: function (opt) { applyPreset(String(opt.data)); },
@@ -789,8 +874,19 @@
     }
 
     var customBgEnabled = !!profile.customBackground;
+    var blurBgEnabled = !!profile.useBlurredBackground;
     var backgroundRows = [
       row(h(InfoField, { key: 'bg_info', label: 'Информация' }, 'Основной фон со страницы игры')),
+      row(h(ToggleField, {
+        key: 'bg_blur', label: 'Блюр вместо фона', checked: blurBgEnabled,
+        description: 'На части страниц Steam сам рисует заблюренную подложку ' +
+          'позади настоящего фона (для заполнения пустого места). Этот ' +
+          'переключатель скрывает настоящий фон и показывает вместо него ' +
+          'эту подложку. Если на странице такой подложки нет, ничего не ' +
+          'изменится. Работает независимо от «Кастом» ниже - оба можно ' +
+          'включить одновременно.',
+        onChange: function (v) { update('useBlurredBackground', v); },
+      })),
       row(h(ToggleField, {
         key: 'bg_custom', label: 'Кастом', checked: customBgEnabled,
         onChange: function (v) { update('customBackground', v); },
@@ -821,7 +917,9 @@
         key: 'cal', layout: 'below', onClick: calibrate, disabled: calibrating,
       }, calibrating ? ('Калибровка... ' + calibrateProgress + '%') : 'Калибровать')),
       row(h(InfoField, { key: 'tip', label: 'Подсказка' },
-        'Держите Steam Deck в обычном игровом положении и нажмите «Калибровать».')),
+        'Держите Steam Deck в обычном игровом положении и нажмите «Калибровать». ' +
+        'Калибровка общая для всех игр и для плагина в целом - не привязана к ' +
+        'конкретной игре.')),
       row(h(ButtonItem, { key: 'reset', layout: 'below', onClick: resetCalibration }, 'Сбросить калибровку')),
     ];
 
@@ -1222,7 +1320,7 @@
     { key: 'resume', label: 'Восстановлений после сна' },
   ];
 
-  function buildDebugDom(doc, onBack) {
+  function buildDebugDom(doc, onBack, onDelayChange, onRampChange, onNativeCloneChange) {
     var root = doc.createElement('div');
     root.id = 'gyroparallax-debug-root';
     root.setAttribute('data-gp-preview', 'true'); // excluded from hero/logo scanning, same as welcome/preview
@@ -1295,6 +1393,166 @@
       fields[def.key] = valueEl;
     });
 
+    // Experimental tuning sliders, visually separated from the read-only
+    // info above - both are diagnostic knobs for chasing the load-delay/
+    // "pop" glitch (see the v1.0.23/v1.0.26/v1.0.27/v1.0.28 README
+    // entries), not normal user preferences, so they live here rather
+    // than in the main settings panel.
+    var expHeading = doc.createElement('div');
+    expHeading.textContent = 'Экспериментальные настройки';
+    expHeading.style.marginTop = '22px';
+    expHeading.style.paddingTop = '16px';
+    expHeading.style.borderTop = '1px solid rgba(255,255,255,0.15)';
+    expHeading.style.fontSize = '0.95em';
+    expHeading.style.fontWeight = '700';
+    expHeading.style.opacity = '0.85';
+    expHeading.style.letterSpacing = '0.02em';
+    card.appendChild(expHeading);
+
+    function buildSliderRow(label, opts) {
+      var rowEl = doc.createElement('div');
+      rowEl.style.marginTop = '10px';
+      rowEl.style.padding = '12px';
+      rowEl.style.background = 'rgba(255,255,255,0.05)';
+      rowEl.style.borderRadius = '8px';
+      card.appendChild(rowEl);
+
+      var labelRow = doc.createElement('div');
+      labelRow.style.display = 'flex';
+      labelRow.style.justifyContent = 'space-between';
+      labelRow.style.alignItems = 'baseline';
+      labelRow.style.gap = '14px';
+      labelRow.style.fontSize = '14px';
+      labelRow.style.marginBottom = '8px';
+      rowEl.appendChild(labelRow);
+
+      var labelEl = doc.createElement('span');
+      labelEl.textContent = label;
+      labelEl.style.opacity = '0.75';
+      labelRow.appendChild(labelEl);
+
+      var valueEl = doc.createElement('span');
+      valueEl.style.fontWeight = '600';
+      labelRow.appendChild(valueEl);
+
+      var sliderEl = doc.createElement('input');
+      sliderEl.type = 'range';
+      sliderEl.min = String(opts.min);
+      sliderEl.max = String(opts.max);
+      sliderEl.step = String(opts.step);
+      sliderEl.style.width = '100%';
+      sliderEl.style.cursor = 'pointer';
+      rowEl.appendChild(sliderEl);
+
+      function setDisplay(v) { valueEl.textContent = opts.format(Number(v)); }
+      sliderEl.oninput = function () { setDisplay(sliderEl.value); };
+      sliderEl.onchange = function () {
+        var raw = Math.round(Number(sliderEl.value) / opts.step) * opts.step;
+        var v = Math.max(opts.min, Math.min(opts.max, raw));
+        setDisplay(v);
+        if (opts.onCommit) opts.onCommit(v);
+      };
+      return { slider: sliderEl, setDisplay: setDisplay };
+    }
+
+    // Maximum time enterGame() will wait for the page to actively go
+    // quiet (see waitForPageSettle()) before starting anyway - usually
+    // ends sooner than this on a page that settles quickly; this is now
+    // a safety cap, not a guaranteed exact wait.
+    var delayCtl = buildSliderRow('Задержка перед включением эффекта (не более)', {
+      min: 0, max: 2000, step: 50,
+      format: function (ms) { return (ms / 1000).toFixed(2) + ' с'; },
+      onCommit: function (ms) { if (onDelayChange) onDelayChange(ms); },
+    });
+    var delaySlider = delayCtl.slider;
+    var setDelayDisplay = delayCtl.setDisplay;
+
+    // How long, once the effect does start, it takes to ease in from 0 to
+    // the profile's configured strength (startupRamp()/rampDurationMs()).
+    // Moved here from the "Настройки" tab - same per-game/global save
+    // rules as every other slider there (edits the active game's profile
+    // if one is open, otherwise the global default).
+    var rampCtl = buildSliderRow('Плавное появление эффекта', {
+      min: 0.5, max: 2, step: 0.5,
+      format: function (s) { return s.toFixed(1) + ' с'; },
+      onCommit: function (s) { if (onRampChange) onRampChange(Math.round(s * 1000)); },
+    });
+    var rampSlider = rampCtl.slider;
+    var setRampDisplay = rampCtl.setDisplay;
+
+    // Highly experimental, off by default - see nativeCloneFor() and the
+    // v1.0.30/v1.0.32 README notes. A checkbox rather than a slider since
+    // it's a binary architecture switch, not a tunable number. v1.0.32:
+    // confirmed working well on real hardware; scope narrowed to the
+    // hero/background only (logo kept on the original direct-animation
+    // path, see scanTargetsUnsafe()).
+    var cloneRow = doc.createElement('div');
+    cloneRow.style.marginTop = '10px';
+    cloneRow.style.padding = '12px';
+    cloneRow.style.background = 'rgba(255,255,255,0.05)';
+    cloneRow.style.borderRadius = '8px';
+    cloneRow.style.display = 'flex';
+    cloneRow.style.justifyContent = 'space-between';
+    cloneRow.style.alignItems = 'center';
+    cloneRow.style.gap = '14px';
+    cloneRow.style.fontSize = '14px';
+    card.appendChild(cloneRow);
+
+    var cloneLabel = doc.createElement('span');
+    cloneLabel.textContent = 'Клонировать обложку вместо прямой анимации (эксперимент)';
+    cloneLabel.style.opacity = '0.75';
+    cloneRow.appendChild(cloneLabel);
+
+    var cloneCheckbox = doc.createElement('input');
+    cloneCheckbox.type = 'checkbox';
+    cloneCheckbox.style.width = '22px';
+    cloneCheckbox.style.height = '22px';
+    cloneCheckbox.style.flexShrink = '0';
+    cloneCheckbox.style.cursor = 'pointer';
+    cloneCheckbox.onchange = function () {
+      if (onNativeCloneChange) onNativeCloneChange(!!cloneCheckbox.checked);
+    };
+    cloneRow.appendChild(cloneCheckbox);
+
+    // Diagnostic readouts for the two experiments above - everything
+    // needed to tell whether they're actually doing what they claim to,
+    // without having to guess from on-screen visuals alone. Same plain
+    // label/value row style as the main debug list, just placed in this
+    // group since both readouts are specific to these two experiments.
+    function buildReadoutRow(label) {
+      var rowEl = doc.createElement('div');
+      rowEl.style.marginTop = '10px';
+      rowEl.style.padding = '9px 12px';
+      rowEl.style.background = 'rgba(255,255,255,0.05)';
+      rowEl.style.borderRadius = '8px';
+      rowEl.style.fontSize = '13px';
+      card.appendChild(rowEl);
+
+      var labelEl = doc.createElement('div');
+      labelEl.textContent = label;
+      labelEl.style.opacity = '0.75';
+      labelEl.style.marginBottom = '4px';
+      rowEl.appendChild(labelEl);
+
+      var valueEl = doc.createElement('div');
+      valueEl.textContent = '-';
+      valueEl.style.fontWeight = '600';
+      valueEl.style.wordBreak = 'break-word';
+      rowEl.appendChild(valueEl);
+      return valueEl;
+    }
+
+    // waitForPageSettle()'s result on the last page entered: how long it
+    // actually waited, whether it stopped because things went quiet or
+    // because it hit the slider's cap, and whether the two browser APIs
+    // it relies on are even supported in this environment.
+    var settleField = buildReadoutRow('Ожидание страницы (последний вход)');
+    // nativeCloneFor()'s live status: how many clones exist right now,
+    // and whether each clone's measured size actually matches the real,
+    // hidden element it's standing in for - a mismatch here is the most
+    // likely visible symptom if this experiment is misbehaving.
+    var cloneStatusField = buildReadoutRow('Клон обложки (сейчас)');
+
     var btnWrap = doc.createElement('div');
     btnWrap.style.display = 'flex';
     btnWrap.style.justifyContent = 'center';
@@ -1316,7 +1574,13 @@
     btn.onclick = function () { if (onBack) onBack(); };
     btnWrap.appendChild(btn);
 
-    return { root: root, fields: fields };
+    return {
+      root: root, fields: fields,
+      delaySlider: delaySlider, setDelayDisplay: setDelayDisplay,
+      rampSlider: rampSlider, setRampDisplay: setRampDisplay,
+      cloneCheckbox: cloneCheckbox,
+      settleField: settleField, cloneStatusField: cloneStatusField,
+    };
   }
 
   function renderDebugDom(dom, state) {
@@ -1335,6 +1599,24 @@
       ? (state.debugResume.count + ' (пауза ' + Math.round(state.debugResume.gapMs) + ' мс, ' +
          Math.max(0, Math.round((Date.now() - state.debugResume.at) / 1000)) + ' с назад)')
       : 'не было');
+    if (dom.delaySlider && state.enterDelayMs != null && dom.delaySlider !== getActiveElementSafe(dom.delaySlider)) {
+      dom.delaySlider.value = String(state.enterDelayMs);
+      dom.setDelayDisplay(state.enterDelayMs);
+    }
+    var rampMs = (state.currentProfile && state.currentProfile.rampDurationMs) || DEFAULT_PROFILE.rampDurationMs;
+    if (dom.rampSlider && dom.rampSlider !== getActiveElementSafe(dom.rampSlider)) {
+      dom.rampSlider.value = String(rampMs / 1000);
+      dom.setRampDisplay(rampMs / 1000);
+    }
+    if (dom.cloneCheckbox && dom.cloneCheckbox !== getActiveElementSafe(dom.cloneCheckbox)) {
+      dom.cloneCheckbox.checked = !!state.useNativeClone;
+    }
+    if (dom.settleField) dom.settleField.textContent = state.debugSettle || 'страница ещё не открывалась в этой сессии';
+    if (dom.cloneStatusField) dom.cloneStatusField.textContent = state.debugNativeClone || 'выкл';
+  }
+
+  function getActiveElementSafe(el) {
+    try { return el.ownerDocument && el.ownerDocument.activeElement; } catch (e) { return null; }
   }
 
   // ---------------------------------------------------------------------
@@ -1357,17 +1639,23 @@
       if (m && m[1]) return m[1];
     }
 
-    try {
-      var doc = (DFL && DFL.findSP && DFL.findSP() && DFL.findSP().document) || document;
-      if (doc) {
-        var el = doc.querySelector('[data-appid], [data-app-id]');
-        if (el) {
-          var id = el.getAttribute('data-appid') || el.getAttribute('data-app-id');
-          if (id && /^\d+$/.test(id)) return id;
-        }
-      }
-    } catch (e) {}
-
+    // There used to be a last-resort DOM fallback here for when the URL
+    // itself doesn't carry the appid: look for a `[data-appid]` element
+    // and trust it under certain conditions (originally "exactly one
+    // match anywhere in the document"; later tightened to also require a
+    // hero-sized box). Both versions were still fooled by the Home
+    // screen's own background: when a game tile is focused, Home shows
+    // that game's hero/backdrop art full-bleed behind the grid, complete
+    // with its own native zoom animation - visually and structurally
+    // indistinguishable from the real game-details page's hero, and
+    // plausibly the *only* `[data-appid]`-bearing element mounted at that
+    // moment too. No DOM heuristic can reliably tell those two apart, so
+    // rather than attempt a third, more convoluted guess, this fallback
+    // is removed outright - detectAppId() now trusts only the URL
+    // (GAME_PAGE_RE above). There is no confirmed case of a real
+    // game-details page whose URL doesn't match that pattern; if one
+    // ever turns up, GAME_PAGE_RE itself should be widened instead of
+    // reintroducing a DOM guess.
     return null;
   }
 
@@ -1692,7 +1980,32 @@
         // dom.fields is always guaranteed valid.
         var existing = doc.getElementById && doc.getElementById('gyroparallax-debug-root');
         if (existing && existing.parentNode) { try { existing.parentNode.removeChild(existing); } catch (e) {} }
-        debugDom = buildDebugDom(doc, dismissDebugPage);
+        debugDom = buildDebugDom(doc, dismissDebugPage, function (ms) {
+          state.enterDelayMs = ms;
+          state.notify();
+          Backend.setEnterDelay(serverApi, ms);
+        }, function (rampMs) {
+          // Same per-game/global save rule as every slider on the
+          // "Настройки" tab: edits the currently open game's profile if
+          // one is open, otherwise the global default - this just moved
+          // here from that tab (see v1.0.28 README notes), the save
+          // behavior didn't change.
+          var next = Object.assign(cloneDefaultProfile(), state.currentProfile || {}, { rampDurationMs: rampMs });
+          state.currentProfile = next;
+          var targetId = state.currentAppId;
+          var p = targetId ? Backend.saveProfile(serverApi, targetId, next) : Backend.saveGlobalSettings(serverApi, next);
+          p.then(function () { state.notify(); });
+        }, function (on) {
+          state.useNativeClone = on;
+          state.notify();
+          Backend.setUseNativeClone(serverApi, on);
+          // Apply immediately rather than waiting for the next page visit -
+          // scanTargets() picks up state.useNativeClone on its very next
+          // run and either starts cloning or (if switched off) scanTargets
+          // -> the else-branch in that same function calls
+          // removeAllNativeClones() to put the real elements back.
+          if (overlayVisible) scanTargets();
+        });
         doc.body.appendChild(debugDom.root);
       }
       state.debugEnabled = true;
@@ -1720,6 +2033,17 @@
 
     var overlayVisible = false;
     var targets = { hero: [], logo: [], middle: [], foreground: [], background2: [] };
+    // Elements currently hidden by the "Блюр вместо фона" toggle (see
+    // scanTargetsUnsafe()) - tracked separately from targets.hero so we can
+    // always find and un-hide exactly these elements again, regardless of
+    // what a later scan does or doesn't include.
+    var blurBgHiddenEls = [];
+    function restoreBlurBgVisibility() {
+      blurBgHiddenEls.forEach(function (el) {
+        if (el && el.style && el.style.visibility === 'hidden') el.style.visibility = '';
+      });
+      blurBgHiddenEls = [];
+    }
     var layerNodes = { middle: null, foreground: null, background2: null };
     // Custom layers, in the order they should stack visually above the real
     // page background: background2 sits just above it, then middle, then
@@ -1730,16 +2054,58 @@
     // though z-index alone would already guarantee the visual order.
     var CUSTOM_LAYER_ORDER = ['background2', 'middle', 'foreground'];
     var CUSTOM_LAYER_ZINDEX = { background2: '2', middle: '5', foreground: '10' };
+    // Normally anchors to the real hero element, but when native-clone mode
+    // (see nativeCloneFor() below) has swapped in a visible clone for it,
+    // anchors to that clone instead - the real element is `visibility:
+    // hidden` at that point, so inserting *after it* would leave these
+    // layers sandwiched behind the clone in DOM order. Combined with the
+    // explicit z-index the clone gets in nativeCloneFor(), this keeps
+    // background2/middle/foreground reliably above the cloned hero both by
+    // z-index and by DOM order.
     function anchorNodeFor(layer, heroEl) {
+      var anchor = (heroEl && heroEl.__gpNativeClone && heroEl.__gpNativeClone.isConnected)
+        ? heroEl.__gpNativeClone : heroEl;
       var idx = CUSTOM_LAYER_ORDER.indexOf(layer);
       for (var i = idx - 1; i >= 0; i--) {
         var prevNode = layerNodes[CUSTOM_LAYER_ORDER[i]];
         if (prevNode && prevNode.parentNode === heroEl.parentNode) return prevNode;
       }
-      return heroEl;
+      return anchor;
     }
     var applied = false;
     var lastHeroKey = null;
+    // Set once per enterGame() call (see below) - not tied to any DOM
+    // detection/heroKey heuristic, so it can't be re-armed or re-triggered
+    // by unrelated rescans the way an earlier, DOM-driven fade attempt was.
+    // Purely "how long ago did we enter this game".
+    var rampStartAt = null;
+    var DEFAULT_RAMP_MS = 500;
+    function rampDurationMs() {
+      var p = state.currentProfile;
+      var ms = p && p.rampDurationMs;
+      if (!ms || ms < 500) return DEFAULT_RAMP_MS;
+      // Clamp to the slider's own four stops so a corrupt/old saved value
+      // can't produce a silently-different duration than what the UI shows.
+      return Math.max(500, Math.min(2000, ms));
+    }
+    // Same curve the old v1.0.8 CSS-transition ease-out used, but folded
+    // directly into the magnitude ramp instead of being a second, separate
+    // animation. A real CSS transition running in parallel with this ramp's
+    // own per-frame style writes would just fight itself (each new frame
+    // retargets the transition mid-flight), so "both effects at once" is
+    // done as one easing curve applied to the one ramp value, rather than
+    // two competing animations on the same translate/scale properties.
+    function easeOutCubic(t) {
+      var inv = 1 - t;
+      return 1 - inv * inv * inv;
+    }
+    function startupRamp() {
+      if (!rampStartAt) return 1;
+      var t = (performance.now() - rampStartAt) / rampDurationMs();
+      if (t >= 1) return 1;
+      if (t <= 0) return 0;
+      return easeOutCubic(t);
+    }
 
     function getDoc() {
       try {
@@ -1774,6 +2140,14 @@
       node.style.margin = '0';
       node.style.maxWidth = 'none';
       node.style.maxHeight = 'none';
+      // Every layer positioned through here (every custom layer, plus the
+      // native hero/logo clones) must always be visible, regardless of
+      // `heroEl`'s own visibility. Run on every scan (not just at creation)
+      // so it's a standing guarantee, not a one-time fix: this is what was
+      // missing when a custom layer got shallow-cloned from an `heroEl`
+      // that native-clone mode had *already* hidden (visibility: hidden) -
+      // the clone silently inherited that and stayed invisible forever.
+      node.style.visibility = 'visible';
     }
 
     function extractImageUrl(el) {
@@ -1790,6 +2164,132 @@
       return null;
     }
 
+    // -----------------------------------------------------------------
+    // Highly experimental, OFF BY DEFAULT (state.useNativeClone - see the
+    // toggle under "Экспериментальные настройки" on the debug page, and
+    // the v1.0.30/v1.0.32 README notes). Architecturally different take on
+    // the load-delay/"pop" glitch from waitForPageSettle() above: instead
+    // of timing *when* it's safe to write a translate/scale onto Steam's
+    // own hero element, this avoids ever writing to that real element at
+    // all. Once the hero element is detected, it's cloned (same
+    // insert-right-after/absolute-position-by-geometry technique already
+    // proven for custom Middle/Foreground/Фон2 layers in syncLayerNodes()
+    // above), the real element is hidden (`visibility: hidden` - keeps
+    // its layout box/size so nothing around it reflows, just stops it
+    // from painting), and every frame's parallax transform is applied to
+    // the clone only. Steam can do whatever it wants to the real,
+    // now-invisible element - there is structurally nothing left for this
+    // plugin to conflict with on it, at any point, not just outside some
+    // guessed or detected "safe" window.
+    //
+    // v1.0.32: confirmed working well on real hardware (together with a
+    // 600ms enter-delay and a 500ms ramp) - scope narrowed to the hero/
+    // background only after testing. The logo intentionally keeps using
+    // the original, already-proven direct-animation path unconditionally
+    // (see scanTargetsUnsafe() - targets.logo is just the real `logo`
+    // array, never run through nativeCloneFor()). nativeCloneFor() below
+    // still accepts a `kind` param generically (so the logo could be
+    // re-added later if ever needed), it's just never called with
+    // 'logo' anymore.
+    //
+    // Real trade-offs, unverified without on-device testing:
+    //   - Uses cloneNode(true) (deep, not shallow) so any decorative
+    //     children Steam renders inside the hero/logo element (gradient
+    //     overlays etc.) are preserved visually - but the clone is a
+    //     frozen snapshot: if Steam ever mutates something *inside* that
+    //     subtree after the clone was taken (not just the top-level image
+    //     itself, which re-cloning on change already handles the same
+    //     way syncLayerNodes() does for custom layers), the clone won't
+    //     reflect that update until the next rescan.
+    //   - `visibility: hidden` on the real element also hides any of its
+    //     own descendants (a badge, hover affordance, etc. nested inside
+    //     it) - cloning should carry those visually, but anything
+    //     *interactive* nested in there (unlikely for a backdrop/logo
+    //     image, but not something this plugin can rule out for every
+    //     possible page layout) would stop being clickable, since the
+    //     original is no longer painted and the clone has
+    //     pointer-events:none.
+    //   - Relies on inserting the clone at the exact same DOM position as
+    //     the (now-invisible) original for correct stacking versus
+    //     sibling UI - the same assumption syncLayerNodes() already
+    //     relies on for custom layers, just now applied to the hero/logo
+    //     themselves rather than an additive extra layer.
+    var nativeCloneNodes = []; // every clone currently inserted, for cleanup
+    var nativeHiddenEls = []; // every real element currently hidden behind a clone
+
+    function stripIds(node) {
+      if (node.removeAttribute) node.removeAttribute('id');
+      if (node.querySelectorAll) {
+        var withIds = node.querySelectorAll('[id]');
+        for (var i = 0; i < withIds.length; i++) withIds[i].removeAttribute('id');
+      }
+    }
+
+    function hideRealNativeEl(el) {
+      if (el.getAttribute('data-gp-native-hidden') === '1') return;
+      el.setAttribute('data-gp-native-hidden', '1');
+      el.__gpPrevVisibility = el.style.visibility;
+      el.style.visibility = 'hidden';
+      nativeHiddenEls.push(el);
+    }
+
+    function restoreRealNativeEl(el) {
+      if (!el || el.getAttribute('data-gp-native-hidden') !== '1') return;
+      el.removeAttribute('data-gp-native-hidden');
+      el.style.visibility = el.__gpPrevVisibility || '';
+      delete el.__gpPrevVisibility;
+    }
+
+    // Returns a clone to use in place of `el` in targets.hero/targets.logo,
+    // reusing the existing clone (repositioned) if `el`'s image hasn't
+    // changed since last time, same caching rule syncLayerNodes() uses for
+    // custom layers.
+    function nativeCloneFor(el, kind) {
+      if (!el || !el.parentNode) return null;
+      var src = extractImageUrl(el);
+      var existing = el.__gpNativeClone;
+      if (existing && existing.isConnected && existing.__gpSrc === src) {
+        positionLayerNode(existing, el);
+        hideRealNativeEl(el);
+        return existing;
+      }
+      if (existing && existing.parentNode) {
+        existing.parentNode.removeChild(existing);
+        var idx = nativeCloneNodes.indexOf(existing);
+        if (idx !== -1) nativeCloneNodes.splice(idx, 1);
+      }
+      var node = el.cloneNode(true);
+      stripIds(node);
+      node.setAttribute('data-gyroparallax', kind === 'logo' ? 'logo-native-clone' : 'hero-native-clone');
+      node.style.pointerEvents = 'none';
+      // Explicit, deterministic z-index rather than whatever the deep
+      // clone happened to inherit from Steam's own CSS classes - without
+      // this the clone could sit above background2/middle/foreground
+      // (z-index 2/5/10) depending on Steam's own styling, hiding those
+      // custom layers. 1 keeps the hero clone just above the untouched
+      // page background but below every custom layer; logo stays at 50,
+      // above everything (unchanged from before).
+      node.style.zIndex = kind === 'logo' ? '50' : '1';
+      node.__gpSrc = src;
+      el.parentNode.insertBefore(node, el.nextSibling);
+      positionLayerNode(node, el);
+      hideRealNativeEl(el);
+      el.__gpNativeClone = node;
+      nativeCloneNodes.push(node);
+      return node;
+    }
+
+    // Reverts everything nativeCloneFor()/hideRealNativeEl() did - removes
+    // every clone and restores every hidden real element. Called when the
+    // experimental mode is switched off, when leaving a game page, or
+    // before a fresh scan replaces the current set of hero/logo elements.
+    function removeAllNativeClones() {
+      nativeCloneNodes.forEach(function (n) { if (n && n.parentNode) n.parentNode.removeChild(n); });
+      nativeCloneNodes = [];
+      nativeHiddenEls.forEach(restoreRealNativeEl);
+      nativeHiddenEls = [];
+    }
+
     function layerTransformOf(layer) {
       var p = state.currentProfile || DEFAULT_PROFILE;
       var lt = p.layerTransform || DEFAULT_PROFILE.layerTransform;
@@ -1801,6 +2301,37 @@
       var isDefault = t.x === 0 && t.y === 0 && t.scale === 1;
       node.style.translate = isDefault ? '' : (t.x.toFixed(2) + 'px ' + t.y.toFixed(2) + 'px');
       node.style.scale = isDefault ? '' : String(t.scale);
+    }
+
+    // Custom layer images are fetched over the network (and/or wait on a
+    // saved profile) and so don't exist in the DOM right away - inserting
+    // one straight at full opacity makes it visibly pop in once the fetch
+    // finally resolves. Easing it in is a one-shot, native CSS transition
+    // (not hand-rolled per-frame JS math) so it can't fight or re-trigger
+    // against anything else: it runs exactly once, right here, at the
+    // moment the node is first created, then gets out of the way. Reuses
+    // the same rampDurationMs the startup ramp uses, so both effects that
+    // play together on page entry (this fade-in, and the translate/scale
+    // ramp in applyOffset()) share a single, consistent "how long does
+    // everything take to settle" duration.
+    function fadeInLayerNode(node, targetOpacity) {
+      var ms = rampDurationMs();
+      node.style.transition = 'opacity ' + ms + 'ms ease-out';
+      node.style.opacity = '0';
+      // Two rAFs: the first lets the browser actually commit/paint the
+      // opacity:0 starting state, the second then flips to the target -
+      // changing it in the very same tick as setting the 0 would collapse
+      // start and end into one paint and skip the animation entirely.
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+          node.style.opacity = String(targetOpacity);
+          // Settings-panel opacity-slider adjustments should stay instant,
+          // like before this change - only the initial appearance fades.
+          window.setTimeout(function () {
+            if (node.style.transition.indexOf('opacity') !== -1) node.style.transition = '';
+          }, ms + 50);
+        });
+      });
     }
 
     function syncLayerNodes(heroList) {
@@ -1826,8 +2357,16 @@
 
         if (node && node.isConnected && node.__gpSrc === src) {
           node.__gpHero = heroEl;
-          if (heroEl.parentNode && node.parentNode !== heroEl.parentNode) {
-            heroEl.parentNode.insertBefore(node, anchorNodeFor(layer, heroEl).nextSibling);
+          // Re-anchor in the DOM whenever the intended anchor (previous
+          // custom layer, or the hero/its native clone) isn't actually
+          // this node's previous sibling anymore - not just on a parent
+          // change. This is what keeps background2/middle/foreground
+          // correctly stacked above a hero clone that appears *after*
+          // these layers already existed (e.g. the clone checkbox gets
+          // turned on later), not just on the very first build.
+          var anchor = anchorNodeFor(layer, heroEl);
+          if (heroEl.parentNode && (node.parentNode !== heroEl.parentNode || node.previousSibling !== anchor)) {
+            heroEl.parentNode.insertBefore(node, anchor.nextSibling);
           }
           positionLayerNode(node, heroEl);
           sizeInfo[layer] = describeLayerSize(node);
@@ -1858,12 +2397,18 @@
         node.style.backdropFilter = 'none';
         node.style.backgroundColor = 'transparent';
         node.style.pointerEvents = 'none';
+        // Note: this is a shallow clone of heroEl (cloneNode(false) above),
+        // which copies heroEl's *current* inline style verbatim - including
+        // visibility: hidden if native-clone mode already hid the real hero
+        // behind its own clone by this point. positionLayerNode() below
+        // forces visibility back to 'visible' on every scan, which is what
+        // actually fixes that; nothing extra needed here.
         // background2 (z-index 2, just above the real page background) <
         // Middle (z-index 5) < Foreground (z-index 10) - all strictly below
         // Logo (z-index 50).
         node.style.zIndex = CUSTOM_LAYER_ZINDEX[layer] || '5';
         applyBaseTransform(node, layer);
-        node.style.opacity = String(layerOpacityOf(layer));
+        fadeInLayerNode(node, layerOpacityOf(layer));
         node.__gpSrc = src;
         node.__gpHero = heroEl;
         heroEl.parentNode.insertBefore(node, anchorNodeFor(layer, heroEl).nextSibling);
@@ -2003,6 +2548,57 @@
       }
       logo = logo.filter(function (el) { return !isPreviewElement(el); });
       hero = hero.filter(function (el) { return !isPreviewElement(el); });
+      // Some game pages render a *second*, blurred/letterboxed copy of the
+      // backdrop behind the real hero image (used to fill extra space when
+      // the art's own aspect ratio doesn't match the box) - syncLayerNodes()
+      // already knew to skip that copy when picking an anchor for custom
+      // layers, but applyOffset() was still transforming BOTH elements by
+      // the same translate/scale every frame. They don't share the same
+      // size/position, so moving both identically could slide them out of
+      // alignment with each other, exposing a sliver of whatever sits
+      // beneath (seen as a stray semi-transparent band, usually at the
+      // bottom) - and doubling the per-frame style writes/paint on exactly
+      // the game pages where this applied also lines up with the reported
+      // extra stutter being specific to those pages. Split the two variants
+      // apart so we can pick exactly one of them to actually show/animate.
+      var heroBlurred = hero.filter(function (el) {
+        var s = el.currentSrc || el.src || el.getAttribute('style') || '';
+        return /blur/i.test(s);
+      });
+      var heroSharp = hero.filter(function (el) {
+        var s = el.currentSrc || el.src || el.getAttribute('style') || '';
+        return !/blur/i.test(s);
+      });
+      // "Блюр вместо фона" (Слои > Фон): show the blurred copy itself as
+      // the background instead of the real hero art, when that copy
+      // actually exists on this page - falls back to the normal sharp
+      // image otherwise rather than ending up with nothing to show.
+      var wantBlurredBg = !!(state.currentProfile && state.currentProfile.useBlurredBackground);
+      var showBlurredBg = wantBlurredBg && heroBlurred.length > 0;
+      if (showBlurredBg) {
+        hero = heroBlurred;
+      } else if (heroSharp.length) {
+        hero = heroSharp;
+      }
+      // Whichever variant isn't the one currently chosen gets hidden
+      // outright, so it doesn't sit visible at its own untouched
+      // position/scale underneath or behind the one we do animate.
+      restoreBlurBgVisibility();
+      eachEl(showBlurredBg ? heroSharp : heroBlurred, function (el) {
+        el.style.visibility = 'hidden';
+        blurBgHiddenEls.push(el);
+      });
+      // The blurred copy is just a static filler, not real art meant to be
+      // tilted/zoomed - it never gets the parallax transform even while
+      // it's the one being shown (that's `hero`, used for anchoring custom
+      // layers/sizing/etc.; `heroAnimate` is the actual applyOffset target
+      // list). Also strip any translate/scale it might carry from a prior
+      // state (e.g. the toggle was flipped, or this is the first scan
+      // after upgrading from a version that did animate it).
+      var heroAnimate = showBlurredBg ? [] : hero;
+      if (showBlurredBg) {
+        eachEl(heroBlurred, function (el) { el.style.translate = ''; el.style.scale = ''; });
+      }
 
       eachEl(logo, function (el) {
         if (getComputedStyle(el).position === 'static') {
@@ -2011,10 +2607,62 @@
         el.style.zIndex = '50';
       });
 
-      if (hero.length !== targets.hero.length || logo.length !== targets.logo.length) clearOffset();
+      // Experimental native-clone mode (see nativeCloneFor() above): swap
+      // the real hero/background elements for persistent clones of them,
+      // and hide the real ones, instead of ever animating the real
+      // elements directly. Off by default (state.useNativeClone) -
+      // heroAnimate (the real elements) is used completely unchanged
+      // otherwise. v1.0.32: logo deliberately excluded from this - confirmed
+      // by testing that cloning the hero/background alone is enough, and
+      // the logo keeps using the original, already-proven direct-animation
+      // path unconditionally (targets.logo is just `logo`, below).
+      var heroForTargets = heroAnimate;
+      if (state.useNativeClone) {
+        heroForTargets = heroAnimate.map(function (el) { return nativeCloneFor(el, 'hero'); }).filter(Boolean);
+        // Anything cloned/hidden on a previous scan that isn't part of
+        // this scan's result (page changed under us) no longer has a live
+        // reference anywhere - drop it so it doesn't linger hidden forever.
+        nativeCloneNodes.slice().forEach(function (n) {
+          if (heroForTargets.indexOf(n) === -1 && n.parentNode) n.parentNode.removeChild(n);
+        });
+        nativeCloneNodes = heroForTargets.slice();
+        nativeHiddenEls.slice().forEach(function (el) {
+          if (heroAnimate.indexOf(el) === -1) restoreRealNativeEl(el);
+        });
+        nativeHiddenEls = nativeHiddenEls.filter(function (el) {
+          return heroAnimate.indexOf(el) !== -1;
+        });
+      } else if (nativeCloneNodes.length || nativeHiddenEls.length) {
+        // Toggle was switched off since the last scan - undo everything.
+        removeAllNativeClones();
+      }
+
+      // Debug readout for the experiment above - size-match check catches
+      // the most likely real-world failure mode (clone geometry drifting
+      // from the real, hidden element's geometry, e.g. after the page
+      // itself resizes/reflows for an unrelated reason).
+      if (state.useNativeClone) {
+        var describeClones = function (clones, reals) {
+          if (!clones.length) return 'нет';
+          return clones.map(function (c, i) {
+            var real = reals[i];
+            var cw = c.offsetWidth, ch = c.offsetHeight;
+            var rw = real ? real.offsetWidth : null, rh = real ? real.offsetHeight : null;
+            var sizeStr = cw + 'x' + ch;
+            if (rw != null) sizeStr += (cw === rw && ch === rh) ? ' = оригинал ✓' : (' ≠ оригинал ' + rw + 'x' + rh + ' ⚠');
+            return sizeStr;
+          }).join(', ');
+        };
+        state.debugNativeClone = 'hero: ' + describeClones(heroForTargets, heroAnimate) +
+          ' | скрыто оригиналов: ' + nativeHiddenEls.length;
+      } else {
+        state.debugNativeClone = 'выкл';
+      }
+
+      if (heroForTargets.length !== targets.hero.length || logo.length !== targets.logo.length) clearOffset();
       var sizeInfo = syncLayerNodes(hero);
       targets = {
-        hero: hero, logo: logo,
+        hero: heroForTargets, logo: logo,
         middle: layerNodes.middle ? [layerNodes.middle] : [],
         foreground: layerNodes.foreground ? [layerNodes.foreground] : [],
         background2: layerNodes.background2 ? [layerNodes.background2] : [],
@@ -2043,7 +2691,23 @@
       var p = state.currentProfile || DEFAULT_PROFILE;
       var st = p.layerStrengths || DEFAULT_PROFILE.layerStrengths;
       var lg = p.logo || DEFAULT_PROFILE.logo;
-      var overscan = overscanScaleFor(p.maxDisplacement);
+      var overscanFull = overscanScaleFor(p.maxDisplacement);
+      // Startup ramp: 0 right as enterGame() fires, easing up to 1 over
+      // this profile's configured rampDurationMs (see "Плавное появление
+      // эффекта" under "Экспериментальные настройки" on the "Отладочная
+      // информация" page) - every tilt-driven displacement/zoom amount
+      // below is scaled by it, so the whole effect eases in from "as if
+      // every slider were at 0" (confirmed to show no jerk at all) up to
+      // the preset's real values, instead of the full configured strength
+      // applying from the very first frame. Each profile value's own
+      // *configured* magnitude is unchanged - only how much of it is
+      // "dialed in" at this instant changes, smoothly, over that window.
+      // Static/already-at-rest placement (a custom layer's own
+      // manual position/size offset, applied elsewhere via
+      // applyBaseTransform before any gyro data even arrives) is
+      // deliberately left alone so it doesn't fight with that.
+      var ramp = startupRamp();
+      var overscan = 1 + (overscanFull - 1) * ramp;
       // While the custom background2 layer is active, the real page
       // background stops moving - both are full-bleed layers, so animating
       // both at once would double the work for a look the user can already
@@ -2051,7 +2715,7 @@
       var bgActive = p.customBackground && wantedLayerImage('background2');
       var bgStrength = bgActive ? 0 : st.background;
       eachEl(targets.hero, function (el) {
-        el.style.translate = (x * bgStrength).toFixed(2) + 'px ' + (y * bgStrength).toFixed(2) + 'px';
+        el.style.translate = (x * bgStrength * ramp).toFixed(2) + 'px ' + (y * bgStrength * ramp).toFixed(2) + 'px';
         el.style.scale = String(overscan);
       });
       CUSTOM_LAYER_ORDER.forEach(function (layer) {
@@ -2060,7 +2724,7 @@
         // rather than getting a separate one - see the "Кастом" toggle note.
         var strength = layer === 'background2' ? st.background : st[layer];
         eachEl(targets[layer], function (el) {
-          el.style.translate = (x * strength + t.x).toFixed(2) + 'px ' + (y * strength + t.y).toFixed(2) + 'px';
+          el.style.translate = (x * strength * ramp + t.x).toFixed(2) + 'px ' + (y * strength * ramp + t.y).toFixed(2) + 'px';
           el.style.scale = String(overscan * t.scale);
         });
       });
@@ -2070,8 +2734,8 @@
           el.style.position = 'relative';
         }
         el.style.zIndex = '50';
-        el.style.translate = (x * st.logo * lg.depth + lg.x).toFixed(2) + 'px ' + (y * st.logo * lg.depth + lg.y).toFixed(2) + 'px';
-        el.style.scale = String(lg.scale);
+        el.style.translate = (x * st.logo * lg.depth * ramp + lg.x * ramp).toFixed(2) + 'px ' + (y * st.logo * lg.depth * ramp + lg.y * ramp).toFixed(2) + 'px';
+        el.style.scale = String(1 + (lg.scale - 1) * ramp);
         el.style.opacity = String(lg.opacity);
       });
       applied = true;
@@ -2147,6 +2811,7 @@
     var stopLoop = startGyroLoop({
       serverAPI: serverApi,
       getEnabled: function () { return overlayVisible && !!(state.currentProfile && state.currentProfile.enabled); },
+      getCurrentAppId: function () { return state.currentAppId; },
       getSettings: function () {
         var p = state.currentProfile || DEFAULT_PROFILE;
         return {
@@ -2154,7 +2819,7 @@
           deadZone: p.deadZone, invertHorizontal: p.invertHorizontal, invertVertical: p.invertVertical,
         };
       },
-      getCalibration: function () { return (state.currentProfile && state.currentProfile.calibration) || { x: 0, y: 0 }; },
+      getCalibration: function () { return state.globalCalibration || { x: 0, y: 0 }; },
       getLayerStrengths: function () { return (state.currentProfile && state.currentProfile.layerStrengths) || DEFAULT_PROFILE.layerStrengths; },
       getLogoExtra: function () { return (state.currentProfile && state.currentProfile.logo) || DEFAULT_PROFILE.logo; },
       applyOffset: applyOffset,
@@ -2210,51 +2875,218 @@
       return Backend.getCustomImage(serverApi, 'global', layer);
     }
 
+    // How long enterGame() waits, doing absolutely nothing to the DOM,
+    // before it starts scanning/fetching/enabling the overlay - see
+    // enterGame()/enteringAppid below and waitForPageSettle() right under
+    // it. state.enterDelayMs (0-2000ms via the slider on the "Отладочная
+    // информация" page - see Backend.getEnterDelay()/setEnterDelay()) is
+    // now a *maximum* safety cap rather than always the exact wait time -
+    // see waitForPageSettle()'s own comment for why and how.
+    // Non-null exactly while a just-entered page is still waiting for
+    // waitForPageSettle() to call back - see enterGame()/pollLocation().
+    var enteringAppid = null;
+
+    // v1.0.24/v1.0.25 tried an adaptive wait via requestIdleCallback
+    // ("is the browser's main thread idle") and it didn't hold up in
+    // real testing - a timeout-forced, not-genuinely-idle firing was
+    // indistinguishable from the real thing in that API, so it could
+    // still fire while Steam was busy on a cold/slow page. v1.0.26
+    // reverted to a flat guessed wait instead (just made it tunable).
+    //
+    // This is a different, more direct kind of adaptive wait: instead of
+    // asking "is the browser busy in general", it asks the one thing we
+    // actually care about - "is *this* page's layout still actively
+    // changing right now" - via two real browser-native signals instead
+    // of a proxy:
+    //   - the Layout Instability API (`PerformanceObserver` with
+    //     `type: 'layout-shift'`), the same standard signal the Core Web
+    //     Vitals "CLS" metric is built on - it fires an event for every
+    //     real on-screen layout shift, which is almost exactly "Steam's
+    //     own page-entrance work is still moving things around".
+    //   - a debounced `MutationObserver` on the whole document, the same
+    //     general "wait for the DOM to settle" technique browser
+    //     automation tools (Puppeteer/Playwright's network-idle-style
+    //     waits) use, as a broader net in case something changes without
+    //     tripping a layout shift (e.g. a class/attribute flip with no
+    //     visible movement).
+    // Either one resets a short quiet timer; once nothing has fired it
+    // for QUIET_MS, the page is considered settled and enterGame()
+    // proceeds immediately - which can be much sooner than the old flat
+    // wait on an already-fast/cached page. state.enterDelayMs is kept as
+    // a hard cap exactly as before: if genuine quiet is never observed
+    // (e.g. some other part of the Steam UI keeps mutating unrelated
+    // elements), it still gives up and proceeds at that mark, so the
+    // worst case is identical to the old flat-wait behavior, never worse.
+    // A small MIN_SETTLE_MS floor stops it from trusting "quiet" in the
+    // first instant, before the observers have had any real chance to
+    // witness Steam's own work starting.
+    //
+    // Caveat, same as every other attempt at this problem: this is a
+    // reasoned guess based on what these browser APIs are documented to
+    // do, not something that can be verified without testing on real
+    // Steam Deck hardware. If it glitches again, the flat-wait mechanism
+    // it's built on top of (the enterDelayMs cap) is still there as a
+    // fallback knob while this gets re-evaluated.
+    function waitForPageSettle(appid, onReady) {
+      var maxMs = Math.max(0, Math.min(2000, state.enterDelayMs == null ? 600 : state.enterDelayMs));
+      var doc = getDoc();
+      if (!doc || !doc.body || typeof MutationObserver === 'undefined') {
+        // No MutationObserver available at all (shouldn't happen in a
+        // real Chromium-based Steam client) - fall back to exactly the
+        // old, already-proven flat wait so nothing regresses.
+        state.debugSettle = 'нет MutationObserver в этом окружении - обычное ожидание ' + maxMs + 'мс';
+        state.notify();
+        window.setTimeout(onReady, maxMs);
+        return;
+      }
+
+      var MIN_SETTLE_MS = 50;
+      var QUIET_MS = 100;
+      var startedAt = performance.now();
+      var lastActivityAt = startedAt;
+      var activityCount = 0;
+      var done = false;
+      var mutationObserver = null;
+      var layoutObserver = null;
+      var layoutShiftSupported = false;
+      var pollHandle = null;
+
+      function markActivity() { lastActivityAt = performance.now(); activityCount++; }
+
+      function cleanup() {
+        if (mutationObserver) { try { mutationObserver.disconnect(); } catch (e) {} mutationObserver = null; }
+        if (layoutObserver) { try { layoutObserver.disconnect(); } catch (e) {} layoutObserver = null; }
+        if (pollHandle != null) { window.clearInterval(pollHandle); pollHandle = null; }
+      }
+
+      function finish(reason) {
+        if (done) return;
+        done = true;
+        var elapsedMs = Math.round(performance.now() - startedAt);
+        state.debugSettle =
+          (reason === 'quiet' ? 'тишина через ' : reason === 'cap' ? 'не дождались, лимит ' : 'прервано на ') +
+          elapsedMs + 'мс (макс. ' + maxMs + 'мс) · событий активности: ' + activityCount +
+          ' · MutationObserver: да · layout-shift: ' + (layoutShiftSupported ? 'да' : 'нет');
+        state.notify();
+        cleanup();
+        onReady();
+      }
+
+      try {
+        mutationObserver = new MutationObserver(markActivity);
+        mutationObserver.observe(doc.body, {
+          childList: true, subtree: true, attributes: true,
+          attributeFilter: ['style', 'class', 'src'],
+        });
+      } catch (e) { mutationObserver = null; }
+
+      if (typeof PerformanceObserver !== 'undefined') {
+        try {
+          if (!PerformanceObserver.supportedEntryTypes ||
+              PerformanceObserver.supportedEntryTypes.indexOf('layout-shift') !== -1) {
+            layoutObserver = new PerformanceObserver(markActivity);
+            layoutObserver.observe({ type: 'layout-shift', buffered: true });
+            layoutShiftSupported = true;
+          }
+        } catch (e) { layoutObserver = null; layoutShiftSupported = false; }
+      }
+
+      // ~2 frames at 60fps - frequent enough that the extra latency this
+      // polling loop itself adds is imperceptible, cheap enough not to
+      // matter for the (at most ~2s) it ever runs.
+      pollHandle = window.setInterval(function () {
+        if (enteringAppid !== appid || state.currentAppId !== appid) { finish('navigated-away'); return; }
+        var now = performance.now();
+        var elapsed = now - startedAt;
+        if (elapsed >= maxMs) { finish('cap'); return; } // safety cap, same role the old flat wait played
+        if (elapsed >= MIN_SETTLE_MS && (now - lastActivityAt) >= QUIET_MS) { finish('quiet'); return; }
+      }, 32);
+    }
+
     function enterGame(appid) {
       if (!appid) return;
-      clearOffset();
-      removeLayerNode('middle');
-      removeLayerNode('foreground');
-      removeLayerNode('background2');
-      targets = { hero: [], logo: [], middle: [], foreground: [], background2: [] };
+      // Claim this appid immediately so pollLocation() doesn't call this
+      // again every ~0.5s while we wait below - but touch nothing else
+      // yet, not even a DOM scan (see pollLocation()'s own
+      // `enteringAppid` check), so Steam's own page-entrance
+      // animation and any asset/cache loading it's doing get a completely
+      // undisturbed moment to finish first. Two different things writing
+      // to/reading from the same page's layout at once (its own transition
+      // plus this plugin scanning/measuring elements, which forces
+      // synchronous layout) was suspected of contributing to the
+      // intermittent load-delay/"pop" glitch.
       state.currentAppId = appid;
-      state.heroBoxSize = null;
-      state.heroPreviewSrc = null;
-      state.logoPreviewSrc = null;
-      state.logoRelBox = null;
-      lastHeroKey = null;
-      state.layerImages = { middle: null, foreground: null, logo: null, background2: null };
-      state.notify();
-
-      Promise.all([
+      enteringAppid = appid;
+      // Fetch the profile/custom-layer-images/artwork right now, in
+      // parallel with the DOM-settle wait below, instead of only starting
+      // once that wait is over. None of this touches the DOM - it's pure
+      // network/IPC (reading files, base64-encoding them, round-tripping
+      // to the backend) - so it can't conflict with Steam's own
+      // page-entrance work the way scanning/rendering can, and there's no
+      // reason to make it wait its turn behind the same delay. Games with
+      // no custom layer images barely notice (those calls just resolve to
+      // null quickly); games *with* custom images - which this fetch can
+      // take real, variable time for - get a head start on it instead of
+      // that time being added sequentially *after* the settle wait,
+      // which was adding its own extra, slider-independent lag whenever
+      // any custom layer was in use.
+      var dataPromise = Promise.all([
         Backend.getProfile(serverApi, appid),
         loadLayerImage(appid, 'middle'),
         loadLayerImage(appid, 'foreground'),
         loadLayerImage(appid, 'logo'),
         loadLayerImage(appid, 'background2'),
         Backend.getArtwork(serverApi, appid),
-      ]).then(function (res) {
-        if (state.currentAppId !== appid) return null;
-        state.currentProfile = Object.assign(cloneDefaultProfile(), res[0] || {});
-        state.layerImages = { middle: res[1] || null, foreground: res[2] || null, logo: res[3] || null, background2: res[4] || null };
-        if (res[5]) {
-          if (!state.logoPreviewSrc && res[5].logo) state.logoPreviewSrc = res[5].logo;
-          if (!state.heroPreviewSrc && (res[5].background || res[5].foreground)) {
-            state.heroPreviewSrc = res[5].background || res[5].foreground;
-          }
-        }
-        overlayVisible = true;
-        scanTargets();
+      ]);
+      waitForPageSettle(appid, function () {
+        if (enteringAppid !== appid || state.currentAppId !== appid) return; // navigated away meanwhile
+        enteringAppid = null;
+        // Start the startup ramp (see applyOffset()) right now, synchronously
+        // - not gated behind the profile/image fetches below, and not tied to
+        // any DOM/heroKey detection, so it fires exactly once per page visit
+        // with no risk of being re-armed by an unrelated rescan later.
+        rampStartAt = performance.now();
+        clearOffset();
+        restoreBlurBgVisibility();
+        removeAllNativeClones();
+        removeLayerNode('middle');
+        removeLayerNode('foreground');
+        removeLayerNode('background2');
+        targets = { hero: [], logo: [], middle: [], foreground: [], background2: [] };
+        state.heroBoxSize = null;
+        state.heroPreviewSrc = null;
+        state.logoPreviewSrc = null;
+        state.logoRelBox = null;
+        lastHeroKey = null;
+        state.layerImages = { middle: null, foreground: null, logo: null, background2: null };
         state.notify();
-        return Backend.startGyro(serverApi);
+
+        dataPromise.then(function (res) {
+          if (state.currentAppId !== appid) return null;
+          state.currentProfile = Object.assign(cloneDefaultProfile(), res[0] || {});
+          state.layerImages = { middle: res[1] || null, foreground: res[2] || null, logo: res[3] || null, background2: res[4] || null };
+          if (res[5]) {
+            if (!state.logoPreviewSrc && res[5].logo) state.logoPreviewSrc = res[5].logo;
+            if (!state.heroPreviewSrc && (res[5].background || res[5].foreground)) {
+              state.heroPreviewSrc = res[5].background || res[5].foreground;
+            }
+          }
+          overlayVisible = true;
+          scanTargets();
+          state.notify();
+          return Backend.startGyro(serverApi);
+        });
       });
     }
 
     function leaveGame() {
       if (!state.currentAppId && !overlayVisible) return;
+      enteringAppid = null;
       overlayVisible = false;
       state.currentAppId = null;
       clearOffset();
+      restoreBlurBgVisibility();
+      removeAllNativeClones();
       removeLayerNode('middle');
       removeLayerNode('foreground');
       removeLayerNode('background2');
@@ -2277,12 +3109,38 @@
       });
     }
 
+    var pendingLeaveTicks = 0;
     function pollLocation() {
       ensurePreviewMounted();
       var appid = detectAppId();
-      if (appid && appid === state.currentAppId) scanTargets();
-      if (appid !== state.currentAppId) {
-        if (appid) { enterGame(appid); } else { leaveGame(); }
+      if (appid && appid === state.currentAppId) {
+        pendingLeaveTicks = 0;
+        // Still waiting out state.enterDelayMs for this very page (see
+        // enterGame()) - don't scan yet, so nothing here touches the page's
+        // layout while Steam's own entrance animation/loading is presumed
+        // to still be happening.
+        if (enteringAppid !== appid) scanTargets();
+        return;
+      }
+      if (appid && appid !== state.currentAppId) {
+        // A different, real game page - always act on this immediately.
+        pendingLeaveTicks = 0;
+        enterGame(appid);
+        return;
+      }
+      if (!state.currentAppId) { pendingLeaveTicks = 0; return; }
+      // detectAppId() came back empty while we thought we were still on a
+      // game page. Don't tear the page down on a single miss - require it
+      // to repeat on the next poll (~0.5s later) first. A one-off miss
+      // here previously called leaveGame() immediately followed by
+      // enterGame() a moment later for the *same* page, which restarts
+      // the entrance ramp, resets the gyro filter and reloads images for
+      // no real navigation - visible as a brief, one-time "pop" right
+      // after the scene had already finished settling in.
+      pendingLeaveTicks++;
+      if (pendingLeaveTicks >= 2) {
+        pendingLeaveTicks = 0;
+        leaveGame();
       }
     }
     var pollHandle = window.setInterval(pollLocation, 500);
@@ -2291,6 +3149,24 @@
     Backend.getGlobalSettings(serverApi).then(function (g) {
       if (!state.currentAppId) {
         state.currentProfile = Object.assign(cloneDefaultProfile(), g || {});
+        state.notify();
+      }
+    });
+    Backend.getCalibration(serverApi).then(function (c) {
+      if (c && typeof c.x === 'number' && typeof c.y === 'number') {
+        state.globalCalibration = c;
+        state.notify();
+      }
+    });
+    Backend.getEnterDelay(serverApi).then(function (r) {
+      if (r && typeof r.ms === 'number') {
+        state.enterDelayMs = r.ms;
+        state.notify();
+      }
+    });
+    Backend.getUseNativeClone(serverApi).then(function (r) {
+      if (r && typeof r.on === 'boolean') {
+        state.useNativeClone = r.on;
         state.notify();
       }
     });
@@ -2307,6 +3183,7 @@
         window.clearInterval(pollHandle);
         stopLoop();
         clearOffset();
+        restoreBlurBgVisibility();
         removeLayerNode('middle');
         removeLayerNode('foreground');
         Backend.stopGyro(serverApi);
